@@ -15,10 +15,19 @@ up)
     gcloud beta emulators pubsub start --host-port=0.0.0.0:8681 --project=jobqueue-test
   run firestore -p 127.0.0.1:8682:8682 gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators \
     gcloud beta emulators firestore start --host-port=0.0.0.0:8682 --project=jobqueue-test
+  run valkey -p 127.0.0.1:6393:6379 valkey/valkey:8.1-alpine
+  # The cookie is given as an argument: some hosts refuse the file the image writes (eacces).
+  run rabbitmq -p 127.0.0.1:5673:5672 -e RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS="-setcookie jobqueuetest" \
+    -e RABBITMQ_CTL_ERL_ARGS="-setcookie jobqueuetest" rabbitmq:4.1-alpine
+  run kafka -p 127.0.0.1:19093:19093 redpandadata/redpanda:v25.2.9 redpanda start --mode dev-container --smp 1 \
+    --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19093 \
+    --advertise-kafka-addr internal://localhost:9092,external://127.0.0.1:19093
   run postgres -p 127.0.0.1:5551:5432 -e POSTGRES_PASSWORD=test -e POSTGRES_DB=jobqueue postgres:16-alpine
   for i in $(seq 1 60); do
     curl -sf http://127.0.0.1:8681 >/dev/null 2>&1 && curl -sf http://127.0.0.1:8682 >/dev/null 2>&1 \
-      && docker exec $P-postgres pg_isready -q -U postgres 2>/dev/null && break
+      && docker exec $P-postgres pg_isready -q -U postgres 2>/dev/null \
+      && docker exec $P-rabbitmq rabbitmq-diagnostics -q check_port_connectivity >/dev/null 2>&1 \
+      && docker exec $P-kafka rpk cluster health 2>/dev/null | grep -q 'Healthy:.*true' && break
     sleep 1
   done
   cat <<VARS
@@ -27,10 +36,13 @@ export JOBQUEUE_TEST_SQS_ENDPOINT=http://127.0.0.1:9331
 export JOBQUEUE_TEST_DYNAMODB_ENDPOINT=http://127.0.0.1:8001
 export JOBQUEUE_TEST_PUBSUB_EMULATOR=127.0.0.1:8681
 export JOBQUEUE_TEST_FIRESTORE_EMULATOR=127.0.0.1:8682
+export JOBQUEUE_TEST_REDIS_ADDR=127.0.0.1:6393
+export JOBQUEUE_TEST_RABBITMQ_URL=amqp://guest:guest@127.0.0.1:5673/
+export JOBQUEUE_TEST_KAFKA_BROKERS=127.0.0.1:19093
 export JOBQUEUE_TEST_POSTGRES_URL=postgres://postgres:test@127.0.0.1:5551/jobqueue?sslmode=disable
 VARS
   ;;
 down)
-  docker rm -f $P-nats $P-sqs $P-dynamodb $P-pubsub $P-firestore $P-postgres >/dev/null 2>&1 || true
+  docker rm -f $P-nats $P-sqs $P-dynamodb $P-pubsub $P-firestore $P-valkey $P-rabbitmq $P-kafka $P-postgres >/dev/null 2>&1 || true
   ;;
 esac

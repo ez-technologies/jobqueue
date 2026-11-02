@@ -278,6 +278,147 @@ func Driver(t *testing.T, newDriver func(t *testing.T) jobqueue.Driver) {
 		}
 		_ = again.Ack(ctx)
 	})
+	t.Run("KeyedJobsRunOneAtATimeInPublishOrder", func(t *testing.T) { Ordering(t, newDriver) })
+	t.Run("BatchesArePublishedFetchedAndSettledOneByOne", func(t *testing.T) { Batches(t, newDriver) })
+}
+
+// Ordering publishes interleaved jobs for three keys and checks that each key's jobs ran one at a time, in publish
+// order, with two workers (two drivers) for a driver that orders by key across processes, else one.
+func Ordering(t *testing.T, newDriver func(t *testing.T) jobqueue.Driver) {
+	ctx := context.Background()
+	kind := Kind("ordered")
+	d1 := newDriver(t)
+	drivers := []jobqueue.Driver{d1}
+	if o, ok := d1.(jobqueue.Orderer); ok && o.OrdersByKey() {
+		drivers = append(drivers, newDriver(t))
+	}
+	q := jobqueue.New(d1)
+	keys := []string{"k1", "k2", "k3"}
+	const per = 6
+	for i := 0; i < per; i++ {
+		for _, k := range keys {
+			if err := q.Publish(ctx, kind, fmt.Sprintf("%s-%02d", k, i), map[string]int{"n": i}, jobqueue.Key(k)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	var mu sync.Mutex
+	seen := map[string][]int{}
+	running := map[string]int{}
+	var overlap atomic.Bool
+	total := atomic.Int32{}
+	h := func(ctx context.Context, j jobqueue.Job) error {
+		var p struct{ N int }
+		_ = j.Decode(&p)
+		mu.Lock()
+		running[j.Key]++
+		if running[j.Key] > 1 {
+			overlap.Store(true)
+		}
+		mu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+		mu.Lock()
+		running[j.Key]--
+		seen[j.Key] = append(seen[j.Key], p.N)
+		mu.Unlock()
+		total.Add(1)
+		return nil
+	}
+	wctx, stop := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	for _, d := range drivers {
+		wg.Go(func() {
+			_ = jobqueue.New(d).Work(wctx, map[string]jobqueue.Handler{kind: h}, jobqueue.WorkOptions{Concurrency: 4, BatchSize: 4})
+		})
+	}
+	deadline := time.Now().Add(60 * time.Second)
+	for total.Load() < int32(per*len(keys)) && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+	}
+	stop()
+	wg.Wait()
+	if total.Load() != int32(per*len(keys)) {
+		t.Fatalf("ran %d of %d", total.Load(), per*len(keys))
+	}
+	if overlap.Load() {
+		t.Fatal("two jobs with the same key ran at once")
+	}
+	for _, k := range keys {
+		for i, n := range seen[k] {
+			if n != i {
+				t.Fatalf("key %s ran in order %v", k, seen[k])
+			}
+		}
+	}
+}
+
+// Batches publishes 25 jobs in one batch and handles them with a batch handler (batches of up to 10): every job is
+// done (at least once), and the one that fails is retried on its own.
+func Batches(t *testing.T, newDriver func(t *testing.T) jobqueue.Driver) {
+	ctx := context.Background()
+	d := newDriver(t)
+	q := jobqueue.New(d)
+	kind := Kind("batch")
+	var pubs []jobqueue.Pub
+	for i := 0; i < 25; i++ {
+		pubs = append(pubs, jobqueue.Pub{Kind: kind, ID: fmt.Sprintf("b-%02d", i), Payload: map[string]int{"n": i}})
+	}
+	if err := q.PublishBatch(ctx, pubs); err != nil {
+		t.Fatalf("publish batch: %v", err)
+	}
+	var mu sync.Mutex
+	done := map[string]int{}
+	failedOnce := false
+	biggest := 0
+	bh := func(ctx context.Context, jobs []jobqueue.Job) []error {
+		mu.Lock()
+		defer mu.Unlock()
+		biggest = max(biggest, len(jobs))
+		errs := make([]error, len(jobs))
+		for i, j := range jobs {
+			if j.ID == "b-07" && !failedOnce {
+				failedOnce = true
+				errs[i] = errors.New("this one fails once")
+				continue
+			}
+			done[j.ID]++
+		}
+		return errs
+	}
+	wctx, stop := context.WithCancel(ctx)
+	finished := make(chan struct{})
+	go func() {
+		_ = q.Work(wctx, nil, jobqueue.WorkOptions{BatchSize: 10, BatchHandlers: map[string]jobqueue.BatchHandler{kind: bh},
+			Backoff: func(int) time.Duration { return time.Second }})
+		close(finished)
+	}()
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(done)
+		mu.Unlock()
+		if n == 25 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	stop()
+	<-finished
+	mu.Lock()
+	defer mu.Unlock()
+	if len(done) != 25 {
+		t.Fatalf("done %d of 25", len(done))
+	}
+	for id, n := range done {
+		if n > 1 {
+			// Delivery is at least once: a broker may hand a job out again (the Pub/Sub emulator does after a nack).
+			t.Logf("%s done %d times", id, n)
+		}
+	}
+	if biggest > 10 {
+		t.Fatalf("a batch of %d, over the size", biggest)
+	}
+	t.Logf("largest batch %d", biggest)
 }
 
 // Lease checks a Lease: one holder at a time, renewal, release, and expiry.

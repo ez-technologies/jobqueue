@@ -7,9 +7,15 @@
 // The broker is a [Driver], one package per platform, so an app links only the SDK it uses:
 //
 //   - natsq: NATS JetStream (any host; delays and repeats are native)
+//   - kafkaq: Kafka, MSK, Confluent, Redpanda (acknowledgement and retries emulated)
+//   - rabbitq: RabbitMQ, Amazon MQ, CloudAMQP (delays through wait queues)
+//   - redisq: Redis / Valkey Streams (delays through a sorted set)
 //   - memq: in memory (tests, single-process apps)
-//   - sqsq: AWS SQS (delays up to 15 minutes are native)
+//   - sqsq: AWS SQS, standard or FIFO (delays up to 15 minutes are native)
 //   - pubsubq: Google Cloud Pub/Sub (no native delays)
+//
+// Jobs are unordered unless they carry a Key: jobs of a kind with the same key run one at a time in publish order.
+// PublishBatch and WorkOptions.BatchSize move jobs in batches; each is still acknowledged on its own.
 //
 // Delays and repeats a driver cannot hold go through a [Scheduler]: a loop, run by one worker at a time (a [Lease]:
 // pgq, natsq, dynamolease, firestorelease, memq), that moves due entries from a [Store] (pgq, memq) to the queue.
@@ -36,6 +42,9 @@ type Message struct {
 	ID string `json:"id"`
 	// Kind selects the handler, e.g. "email.send". Letters, digits, '.', '_' and '-'.
 	Kind string `json:"kind"`
+	// Key, when set, orders the job: jobs of one kind with the same key run one at a time, in publish order (see
+	// "Ordering" in the README for what each driver guarantees). Empty: no order, the fastest.
+	Key string `json:"key,omitempty"`
 	// Payload is the job's JSON.
 	Payload json.RawMessage `json:"payload,omitempty"`
 }
@@ -87,6 +96,23 @@ type Repeater interface {
 	SendEvery(ctx context.Context, m Message, every time.Duration) error
 }
 
+// BatchSender is a Driver that sends many undelayed messages in few round trips (SQS batches of 10, a NATS async
+// publish window, Kafka and Pub/Sub batches, a Redis pipeline).
+type BatchSender interface {
+	SendBatch(ctx context.Context, ms []Message) error
+}
+
+// BatchReceiver is a Driver that fetches up to max messages of kind in one call. Each is still acknowledged on its own.
+type BatchReceiver interface {
+	ReceiveBatch(ctx context.Context, kind string, max int) ([]Delivery, error)
+}
+
+// Orderer is a Driver that keeps jobs with the same Key in order across all workers by itself. For other drivers the
+// Queue runs keyed jobs one at a time per key within each process only.
+type Orderer interface {
+	OrdersByKey() bool
+}
+
 // ErrNoScheduler is returned for a delay or repeat the driver cannot hold when the Queue has no Scheduler.
 var ErrNoScheduler = errors.New("jobqueue: this driver cannot hold the delay or repeat, and no Scheduler is set")
 
@@ -122,10 +148,14 @@ func IsPermanent(err error) bool {
 type PublishOption func(*publishOptions)
 
 type publishOptions struct {
+	key   string
 	after time.Duration
 	at    time.Time
 	every time.Duration
 }
+
+// Key orders the job among the jobs of its kind with the same key (see Message.Key).
+func Key(key string) PublishOption { return func(o *publishOptions) { o.key = key } }
 
 // After delays the job by d.
 func After(d time.Duration) PublishOption { return func(o *publishOptions) { o.after = d } }
@@ -185,11 +215,11 @@ func (q *Queue) Publish(ctx context.Context, kind, id string, payload any, opts 
 		}
 		raw = b
 	}
-	m := Message{ID: id, Kind: kind, Payload: raw}
 	var o publishOptions
 	for _, opt := range opts {
 		opt(&o)
 	}
+	m := Message{ID: id, Kind: kind, Key: o.key, Payload: raw}
 	if o.every > 0 {
 		if o.every < time.Second {
 			return errors.New("jobqueue: Every must be at least one second")
@@ -216,6 +246,54 @@ func (q *Queue) Publish(ctx context.Context, kind, id string, payload any, opts 
 		return ErrNoScheduler
 	}
 	return q.sched.Store.Put(ctx, Entry{Message: m, Due: q.now().Add(delay)})
+}
+
+// Pub is one job of PublishBatch.
+type Pub struct {
+	Kind, ID, Key string
+	Payload       any
+}
+
+func marshal(payload any) (json.RawMessage, error) {
+	switch p := payload.(type) {
+	case nil:
+		return nil, nil
+	case json.RawMessage:
+		return p, nil
+	default:
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return nil, fmt.Errorf("jobqueue: payload: %w", err)
+		}
+		return b, nil
+	}
+}
+
+// PublishBatch sends undelayed jobs in as few round trips as the driver allows (a BatchSender), else one by one.
+func (q *Queue) PublishBatch(ctx context.Context, jobs []Pub) error {
+	ms := make([]Message, 0, len(jobs))
+	for _, j := range jobs {
+		if !ValidKind(j.Kind) {
+			return fmt.Errorf("%w: %q", ErrInvalidKind, j.Kind)
+		}
+		if j.ID == "" {
+			return errors.New("jobqueue: empty job id")
+		}
+		raw, err := marshal(j.Payload)
+		if err != nil {
+			return err
+		}
+		ms = append(ms, Message{ID: j.ID, Kind: j.Kind, Key: j.Key, Payload: raw})
+	}
+	if b, ok := q.d.(BatchSender); ok {
+		return b.SendBatch(ctx, ms)
+	}
+	for _, m := range ms {
+		if err := q.d.Send(ctx, m, 0); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Close closes the driver.
