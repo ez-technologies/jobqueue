@@ -75,9 +75,9 @@ func (d *Driver) shard(key string) int {
 // target is the subject a message goes to: its kind's, or its key's lane.
 func (d *Driver) target(m jobqueue.Message) string {
 	if m.Key != "" {
-		return fmt.Sprintf("%s.key.%d.%s", d.cfg.Prefix, d.shard(m.Key), m.Kind)
+		return fmt.Sprintf("%s.key.%d.%s", d.cfg.Prefix, d.shard(m.Key), m.Route())
 	}
-	return d.run(m.Kind)
+	return d.run(m.Route())
 }
 
 // SendBatch publishes undelayed messages asynchronously and waits for all acknowledgements.
@@ -88,7 +88,7 @@ func (d *Driver) SendBatch(ctx context.Context, ms []jobqueue.Message) error {
 		if err != nil {
 			return err
 		}
-		f, err := d.js.PublishAsync(d.target(m), data, jetstream.WithMsgID(m.Kind+":"+m.ID))
+		f, err := d.js.PublishAsync(d.target(m), data, jetstream.WithMsgID(msgID(m)))
 		if err != nil {
 			return err
 		}
@@ -164,6 +164,15 @@ func New(ctx context.Context, js jetstream.JetStream, cfg Config) (*Driver, erro
 
 var unsafe = regexp.MustCompile(`[^A-Za-z0-9_-]`)
 
+// msgID de-duplicates publishes: one per route, job id and attempt (a retry copy is a new message).
+func msgID(m jobqueue.Message) string {
+	id := m.Route() + ":" + m.ID
+	if m.Retry != nil {
+		id += fmt.Sprintf(":%d", m.Retry.Attempt)
+	}
+	return id
+}
+
 // token makes s usable as one subject token or a name.
 func token(s string) string { return unsafe.ReplaceAllString(s, "_") }
 
@@ -181,12 +190,12 @@ func (d *Driver) Send(ctx context.Context, m jobqueue.Message, delay time.Durati
 		return err
 	}
 	if delay <= 0 {
-		_, err = d.js.Publish(ctx, d.target(m), data, jetstream.WithMsgID(m.Kind+":"+m.ID))
+		_, err = d.js.Publish(ctx, d.target(m), data, jetstream.WithMsgID(msgID(m)))
 		return err
 	}
 	// Schedules are to the second: round up, so it is never early.
 	at := time.Now().Add(delay).Truncate(time.Second).Add(time.Second)
-	msg := nats.NewMsg(d.cfg.Prefix + ".sched." + token(m.Kind+"."+m.ID))
+	msg := nats.NewMsg(d.cfg.Prefix + ".sched." + token(msgID(m)))
 	msg.Data = data
 	msg.Header.Set("Nats-Rollup", "sub")
 	_, err = d.js.PublishMsg(ctx, msg, jetstream.WithScheduleAt(at), jetstream.WithScheduleTarget(d.target(m)))
@@ -199,7 +208,7 @@ func (d *Driver) SendEvery(ctx context.Context, m jobqueue.Message, every time.D
 	if err != nil {
 		return err
 	}
-	msg := nats.NewMsg(d.cfg.Prefix + ".sched." + token(m.Kind+"."+m.ID))
+	msg := nats.NewMsg(d.cfg.Prefix + ".sched." + token(msgID(m)))
 	msg.Data = data
 	msg.Header.Set("Nats-Rollup", "sub")
 	_, err = d.js.PublishMsg(ctx, msg, jetstream.WithScheduleEvery(every), jetstream.WithScheduleTarget(d.target(m)))
@@ -347,7 +356,15 @@ type delivery struct {
 	attempt int
 }
 
-func (x *delivery) Message() jobqueue.Message        { return x.m }
+func (x *delivery) Message() jobqueue.Message { return x.m }
+
+// Origin is the stream and sequence the job was delivered from.
+func (x *delivery) Origin() string {
+	if meta, err := x.msg.Metadata(); err == nil {
+		return fmt.Sprintf("nats:%s/%d", meta.Stream, meta.Sequence.Stream)
+	}
+	return "nats:" + x.msg.Subject()
+}
 func (x *delivery) Attempt() int                     { return x.attempt }
 func (x *delivery) Ack(ctx context.Context) error    { return x.msg.DoubleAck(ctx) }
 func (x *delivery) Extend(ctx context.Context) error { return x.msg.InProgress() }

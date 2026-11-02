@@ -2,8 +2,10 @@ package natsq
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strconv"
 	"time"
 
 	"github.com/nats-io/nats.go/jetstream"
@@ -93,4 +95,61 @@ func (l *Lease) Release(ctx context.Context, name, holder string) error {
 func isConflict(err error) bool {
 	var apiErr *jetstream.APIError
 	return errors.As(err, &apiErr) && apiErr.ErrorCode == jetstream.JSErrCodeStreamWrongLastSequence
+}
+
+// VersionStore keeps the newest version per key in a key-value bucket (default "jobqueue_versions"), raised by
+// compare-and-set.
+type VersionStore struct{ kv jetstream.KeyValue }
+
+// NewVersionStore makes (or opens) the bucket.
+func NewVersionStore(ctx context.Context, js jetstream.JetStream, bucket string) (*VersionStore, error) {
+	if bucket == "" {
+		bucket = "jobqueue_versions"
+	}
+	kv, err := js.CreateOrUpdateKeyValue(ctx, jetstream.KeyValueConfig{Bucket: bucket, History: 1})
+	if err != nil {
+		return nil, err
+	}
+	return &VersionStore{kv: kv}, nil
+}
+
+var _ jobqueue.VersionStore = (*VersionStore)(nil)
+
+func versionKey(key string) string { return hex.EncodeToString([]byte(key)) }
+
+func (v *VersionStore) Observe(ctx context.Context, key string, version int64) error {
+	k := versionKey(key)
+	val := []byte(strconv.FormatInt(version, 10))
+	for range 20 {
+		e, err := v.kv.Get(ctx, k)
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
+			if _, err := v.kv.Create(ctx, k, val); err == nil || !errors.Is(err, jetstream.ErrKeyExists) {
+				return err
+			}
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		cur, _ := strconv.ParseInt(string(e.Value()), 10, 64)
+		if cur >= version {
+			return nil
+		}
+		if _, err := v.kv.Update(ctx, k, val, e.Revision()); err == nil || !isConflict(err) {
+			return err
+		}
+	}
+	return errors.New("natsq: version: too many concurrent updates")
+}
+
+func (v *VersionStore) Latest(ctx context.Context, key string) (int64, bool, error) {
+	e, err := v.kv.Get(ctx, versionKey(key))
+	if errors.Is(err, jetstream.ErrKeyNotFound) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	n, err := strconv.ParseInt(string(e.Value()), 10, 64)
+	return n, err == nil, err
 }

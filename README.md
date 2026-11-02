@@ -9,7 +9,11 @@
 - One adapter per platform, each in its own package, so your binary links only the SDK it uses:
   **NATS JetStream**, **Kafka** (Apache Kafka, AWS MSK, Confluent, Redpanda), **RabbitMQ** (Amazon MQ, CloudAMQP),
   **Redis / Valkey Streams**, **AWS SQS**, **Google Cloud Pub/Sub**, and **in memory** for tests.
-- Unordered by default, for throughput; an optional **ordering key** runs a key's jobs one at a time in publish order.
+- **No head-of-line blocking**: a failed job is re-published with its retry details and the original acknowledged at
+  once; every job has a timeout; slow work runs in **lanes** of its own.
+- Unordered by default, for throughput; an optional **ordering key** runs a key's jobs one at a time in publish order;
+  a key that keeps failing is **parked** (only that key waits).
+- **Skip what is already covered**: a retry hook and a ready-made supersede-by-version check.
 - **Batches**: publish in batches, fetch in batches, acknowledge each job on its own; an optional batch handler.
 - Delays a broker cannot hold go through a **scheduler loop**; one worker runs it at a time, chosen by a pluggable
   **lease**: PostgreSQL, NATS KV, DynamoDB or Firestore.
@@ -22,6 +26,9 @@
 
 - [Install](#install)
 - [Quick start](#quick-start)
+- [Rules for the next developer](#rules-for-the-next-developer) (also [AGENTS.md](AGENTS.md))
+- [Configuration](#configuration)
+- [Choosing settings](#choosing-settings)
 - [How to](#how-to)
   - [Retries, back-off and dead letters](#retries-back-off-and-dead-letters)
   - [Delayed and repeating jobs](#delayed-and-repeating-jobs)
@@ -29,6 +36,9 @@
   - [Stop gracefully on SIGTERM (spot machines)](#stop-gracefully-on-sigterm-spot-machines)
   - [Do it once: idempotent handlers](#do-it-once-idempotent-handlers)
   - [Run only some kinds in a worker](#run-only-some-kinds-in-a-worker)
+  - [Failures never hold up the rest](#failures-never-hold-up-the-rest)
+  - [Lanes for slow work](#lanes-for-slow-work)
+  - [Skip a job a newer one covers](#skip-a-job-a-newer-one-covers)
   - [Order jobs by key](#order-jobs-by-key)
   - [Batches](#batches)
   - [Test your handlers](#test-your-handlers)
@@ -100,6 +110,81 @@ err = q.Work(ctx, map[string]jobqueue.Handler{
 ```
 
 The same app on SQS or Pub/Sub changes only the driver line; see [Run it on](#run-it-on-local--aws--google).
+
+## Rules for the next developer
+
+Read these before changing a handler or a setting ([AGENTS.md](AGENTS.md) has the same list for coding agents):
+
+1. **Handlers must be idempotent.** Every broker here delivers at least once. Use `Once` with a done-log for effects.
+2. **Never assume order unless the jobs carry a key** (and the mode is keyed-ordered).
+3. **Never do long work without a lane and a timeout.** A transcription in the lane of the pushes delays the pushes.
+4. **Kafka commits lag behind the slowest running job of a partition** (see [Kafka](#kafka-what-is-emulated)).
+5. **SQS holds at most 15 minutes of delay; Pub/Sub holds none.** Longer delays need a Scheduler.
+6. **Ordered keys can stall.** A key that keeps failing is parked: watch the alerts (`OnParked`, the error log) and
+   the dead letters, fix, then `Unpark`.
+7. **Batch handlers must return one result per job**, in order. A missing one counts as a failure.
+8. **Skipping is final.** Skip a job only when a newer job, or the current state, already covers its effect.
+9. **Test a new adapter or store with the conformance suite** (`jobqueuetest`).
+
+## Configuration
+
+One struct per queue, `jobqueue.WorkOptions`, with good defaults (the zero value works):
+
+| Field | Default | Meaning |
+|---|---|---|
+| `Mode` | keyed-ordered | `KeyedOrdered`: jobs with a key run one at a time per key, in publish order; others unordered. `Unordered`: keys ignored |
+| `BatchSize` | 1 | jobs one fetch may take; each is still acknowledged on its own |
+| `Concurrency` | 1 | jobs of each kind (route) running at once in this process: the most in flight |
+| `Timeout` | 5 min | a job running longer has failed and is re-published (handlers must honour their ctx) |
+| `MaxAttempts` | 5 | tries before the dead letters |
+| `Backoff`, `Jitter` | 5 s, 30 s, 2 min, 10 min, 30 min; ±20 % | wait before the next attempt |
+| `RetryRoute` | `Republish` | `Republish`: a copy with `RetryInfo`, delayed by the back-off (Kafka: retry-topic tiers), the original acknowledged at once. `Nack`: the broker redelivers the same message |
+| dead-letter name | per driver | NATS `<STREAM>_DEAD`, SQS `<prefix>-<kind>-dead`, Pub/Sub `<prefix>-dead`, Kafka `<prefix>.dead`, RabbitMQ `<prefix>.dead`, Redis `<prefix>:dead` |
+| `KeyPolicy`, `KeyAttempts` | `Park`, 3 | a keyed job that keeps failing: retried in place `KeyAttempts` times while its key waits, then its key is parked. `RetryInPlace`: up to `MaxAttempts`, then dead-lettered and the key goes on |
+| `Parked`, `OnParked` | in this process; none | where parked keys are kept (`pgq.ParkStore` shares them); the alert |
+| `Lanes`, `OnlyLanes` | none; all | lanes by name (kinds, concurrency, batch, timeout); the lanes this process runs (`"default"` is the rest) |
+| `ShouldSkip`, `SkipFirstAttempt` | none; false | asked before a retry (and a first attempt): skip what is covered (`Supersede`) |
+| `RetryHandlers` | none | per kind, run the re-published copy instead of the handler |
+| `BatchHandlers` | none | per kind, take a whole batch, return a result per job |
+| `StopGrace` | 25 s | on SIGTERM, how long running jobs may finish |
+| `ExtendEvery` | 20 s | how often a running job is kept hidden from other workers |
+| `Logger`, `OnDone` | `slog.Default()`, none | logs; one call per job: `done`, `retry`, `dead`, `parked`, `skipped`, `released` |
+
+Per-backend extras are in the driver's `Config`: Kafka `Partitions`, `RetryTiers` (5 s, 1 min, 10 min); SQS `FIFO`,
+`Visibility`; Pub/Sub `AckDeadline`, `Ordering`; NATS and RabbitMQ `KeyShards`; Redis `Visibility` (see [Options](#options)).
+
+## Choosing settings
+
+**Fast notifications** (pushes, chat messages): unordered, many at once, short timeout, skip what is covered.
+
+```go
+jobqueue.WorkOptions{Mode: jobqueue.Unordered, Concurrency: 32, BatchSize: 50, Timeout: 30 * time.Second,
+	MaxAttempts: 4, ShouldSkip: coveredByNewerPushOrRead}
+```
+
+**Slow media jobs** (transcription, video): their own lane and workers, long timeout, few at a time.
+
+```go
+jobqueue.WorkOptions{Lanes: map[string]jobqueue.Lane{"media": {Kinds: []string{"transcribe", "video.encode"},
+	Concurrency: 1, Timeout: 15 * time.Minute}}, OnlyLanes: []string{"media"}} // on the big machine
+// and OnlyLanes: []string{"default"} on the small ones
+```
+
+**Strictly ordered updates per entity** (an account's ledger): keyed-ordered, a shared park store, an alert.
+
+```go
+q.Publish(ctx, "ledger.apply", evt.ID, evt, jobqueue.Key("account-"+id))
+jobqueue.WorkOptions{KeyAttempts: 3, Parked: pgq.NewParkStore(db), OnParked: page}
+```
+
+**Very high throughput on Kafka**: many partitions, big batches, unordered unless needed, short timeouts (they bound
+the commit lag), retry tiers that match your back-off.
+
+```go
+kafkaq.Config{Partitions: 48, RetryTiers: []time.Duration{5 * time.Second, time.Minute}}
+jobqueue.WorkOptions{Mode: jobqueue.Unordered, BatchSize: 500, Concurrency: 256, Timeout: 20 * time.Second,
+	Backoff: func(int) time.Duration { return 5 * time.Second }}
+```
 
 ## How to
 
@@ -186,6 +271,54 @@ Prune old keys from a daily job: `done.Prune(ctx, 7*24*time.Hour)`.
 Each kind has its own consumer (NATS), queue (SQS) or subscription (Pub/Sub), shared by every worker that handles
 it. Start a worker with the handlers it should run: a small machine for `push.*`, a big one for `video.encode`.
 
+### Failures never hold up the rest
+
+A failed job is **not retried in place**. It is published again as a copy carrying `RetryInfo` (attempt, where it
+first came from: queue, topic/partition/offset or stream id; first-failure time; last error; next-attempt time) with
+the back-off as its delay, and the original is acknowledged (Kafka: its offset marked done) at once. The copy waits in
+the broker: a NATS schedule, SQS `DelaySeconds`, a Kafka retry-topic tier, a RabbitMQ wait queue, the Redis delayed
+set, or the Scheduler. The jobs behind it run meanwhile. A job that runs past `Timeout` counts as failed.
+
+Keyed jobs are the exception: re-publishing would let the key's next job overtake it (see below).
+
+### Lanes for slow work
+
+```go
+q.Publish(ctx, "image.resize", id, p, jobqueue.InLane("slow")) // this one is big
+q.Work(ctx, handlers, jobqueue.WorkOptions{
+	Lanes:     map[string]jobqueue.Lane{"slow": {Kinds: []string{"transcribe"}, Concurrency: 1, Timeout: 15 * time.Minute}},
+	OnlyLanes: []string{"slow"}, // this process runs the slow lane only
+})
+```
+
+A lane has its own queue (topic, subscription, stream: `<kind>.lane-<name>` for jobs published into it; a kind listed
+in `Kinds` keeps its own queue), its own workers and its own concurrency, batch size and timeout, so slow work never
+shares a batch or a worker slot with fast work.
+
+### Skip a job a newer one covers
+
+Ask one question: **does a newer job, or the current state, already cover the effect of this one?**
+
+- **Yes: skip it.** A notification about a conversation when a newer notification for the same person and
+  conversation was sent, or the person already read past that message (opening the conversation shows everything);
+  a summary or a recompute; an entity sync.
+- **No: never skip.** Jobs where each one has its own effect that nothing later covers: a payment or a charge, a
+  distinct email or letter, a one-time code, an audit record.
+
+```go
+versions := pgq.NewVersionStore(db) // or natsq, redisq, dynamolease, firestorelease, NewMemoryVersions
+q := jobqueue.New(driver, jobqueue.WithVersions(versions))
+q.Publish(ctx, "summary.recompute", id, p, jobqueue.Version("topic-7", eventID)) // the store keeps the newest per kind+entity
+q.Work(ctx, handlers, jobqueue.WorkOptions{ShouldSkip: jobqueue.Supersede(versions)})
+```
+
+`Supersede` skips a retry whose version is lower than the newest one published for its entity, even while that newer
+job is still running. Or pass your own `ShouldSkip` that reads your database. Scope the entity to what the effect
+covers: for a push, person and conversation, not the person alone. **The version must grow with every change of its
+entity, and a skip is final**: the job is acknowledged, logged with the reason and reported as `skipped`. By default
+only retries are checked; `SkipFirstAttempt` checks first attempts too. `RetryHandlers` run a re-published copy with a
+handler of its own (it gets the `RetryInfo`).
+
 ### Order jobs by key
 
 There is **no global order**: delivery is at least once and unordered by default, which is what lets many workers
@@ -196,8 +329,12 @@ key:
 q.Publish(ctx, "account.apply", "evt-981", ev, jobqueue.Key("account-17"))
 ```
 
-Jobs of a kind with the same key run one at a time, in publish order. A keyed job that fails is retried **in place**
-(its followers wait) until it succeeds or goes to the dead letters. How each driver keeps the order:
+Jobs of a kind with the same key run one at a time, in publish order. **A failing keyed job blocks only its own key**,
+never the batch or other keys: it is retried in place `KeyAttempts` times (3) while its key waits, then, by default,
+its key is **parked**: the job and the key's following jobs go to the dead letters, in order, an error is logged and
+`OnParked` called, until `Unpark`. With `KeyPolicy: RetryInPlace` it is retried up to `MaxAttempts`, then
+dead-lettered and the key goes on (that job is then out of order). Choose deliberately, and watch parked keys. How each
+driver keeps the order:
 
 | Driver | Mapping | Across all workers? |
 |---|---|---|
@@ -431,9 +568,14 @@ Kafka keeps an offset per partition, not an acknowledgement per message, and hol
 - **Acknowledgement**: tracks the offsets it handed out per partition and commits a partition only up to the first
   job not yet done. A crash redelivers every unfinished job (and some finished ones after it): at least once. One
   slow job holds back its partition's commit, not the work after it.
-- **Retries** go through `<prefix>.<kind>.retry` with the attempt and a not-before time; the driver reads it in order,
-  waits until each is due and puts it back on the kind's topic. Head-of-line: a 30-minute back-off delays the
-  5-second ones behind it. Keyed jobs never use it: they are retried in place, so order holds.
+- **Retries** are re-published to a retry tier, `<prefix>.<kind>.retry-<tier>` (`RetryTiers`, default 5 s, 1 min,
+  10 min: the smallest tier at least as long as the back-off), with a not-before time; each tier is read in order and
+  put back on the kind's topic when due. All records of a tier wait about as long, so no long back-off holds up a
+  short one. Longer delays go through the Scheduler. Keyed jobs are retried in place (their key only waits).
+- **Commit lag, worst case**: a partition's committed offset can stay behind by the records handed out since its
+  oldest unfinished one. That job ends within `Timeout` (then it is re-published and its offset counts as done), so
+  the lag is at most `Timeout` plus a re-publish, and after a crash at most that window of jobs runs again. For keyed
+  jobs add `KeyAttempts` × (`Timeout` + back-off). Keep timeouts short where throughput matters.
 - **Dead letters** go to `<prefix>.dead` with the attempts and the error in headers.
 - **Delays and repeats** go through the Scheduler (`MaxDelay` is 0).
 - **Order**: a key maps to one partition, a partition to one group member, and the driver holds a key's next record

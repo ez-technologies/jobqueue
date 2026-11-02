@@ -5,6 +5,7 @@ package firestorelease
 
 import (
 	"context"
+	"encoding/hex"
 	"time"
 
 	"cloud.google.com/go/firestore"
@@ -83,4 +84,59 @@ func (l *Lease) Release(ctx context.Context, name, holder string) error {
 		}
 		return tx.Delete(ref)
 	})
+}
+
+// VersionStore keeps the newest version per key in a collection (default "jobqueue_versions"), raised in a
+// transaction.
+type VersionStore struct {
+	c   *firestore.Client
+	col string
+}
+
+// NewVersionStore returns versions in collection.
+func NewVersionStore(c *firestore.Client, collection string) *VersionStore {
+	if collection == "" {
+		collection = "jobqueue_versions"
+	}
+	return &VersionStore{c: c, col: collection}
+}
+
+var _ jobqueue.VersionStore = (*VersionStore)(nil)
+
+func (v *VersionStore) ref(key string) *firestore.DocumentRef {
+	return v.c.Collection(v.col).Doc(hex.EncodeToString([]byte(key)))
+}
+
+func (v *VersionStore) Observe(ctx context.Context, key string, version int64) error {
+	ref := v.ref(key)
+	return v.c.RunTransaction(ctx, func(ctx context.Context, tx *firestore.Transaction) error {
+		snap, err := tx.Get(ref)
+		if err != nil && status.Code(err) != codes.NotFound {
+			return err
+		}
+		if err == nil && snap.Exists() {
+			if cur, err := snap.DataAt("v"); err == nil {
+				if n, ok := cur.(int64); ok && n >= version {
+					return nil
+				}
+			}
+		}
+		return tx.Set(ref, map[string]any{"v": version})
+	})
+}
+
+func (v *VersionStore) Latest(ctx context.Context, key string) (int64, bool, error) {
+	snap, err := v.ref(key).Get(ctx)
+	if status.Code(err) == codes.NotFound {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	cur, err := snap.DataAt("v")
+	if err != nil {
+		return 0, false, err
+	}
+	n, ok := cur.(int64)
+	return n, ok, nil
 }

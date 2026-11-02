@@ -131,7 +131,7 @@ func (d *Driver) hold(ctx context.Context, pipe redis.Pipeliner, m jobqueue.Mess
 	if err != nil {
 		return err
 	}
-	member, err := json.Marshal(held{Stream: d.stream(m.Kind), Message: string(mj), Attempt: attempt, Nonce: hex.EncodeToString(b)})
+	member, err := json.Marshal(held{Stream: d.stream(m.Route()), Message: string(mj), Attempt: attempt, Nonce: hex.EncodeToString(b)})
 	if err != nil {
 		return err
 	}
@@ -155,14 +155,14 @@ func (d *Driver) Send(ctx context.Context, m jobqueue.Message, delay time.Durati
 func (d *Driver) SendBatch(ctx context.Context, ms []jobqueue.Message) error {
 	pipe := d.c.Pipeline()
 	for _, m := range ms {
-		if err := d.group(ctx, m.Kind); err != nil {
+		if err := d.group(ctx, m.Route()); err != nil {
 			return err
 		}
 		f, err := fields(m, 1)
 		if err != nil {
 			return err
 		}
-		pipe.XAdd(ctx, &redis.XAddArgs{Stream: d.stream(m.Kind), Values: f})
+		pipe.XAdd(ctx, &redis.XAddArgs{Stream: d.stream(m.Route()), Values: f})
 	}
 	_, err := pipe.Exec(ctx)
 	return err
@@ -291,7 +291,10 @@ type delivery struct {
 }
 
 func (x *delivery) Message() jobqueue.Message { return x.m }
-func (x *delivery) Attempt() int              { return x.attempt }
+
+// Origin is the stream and the entry id.
+func (x *delivery) Origin() string { return "redis:" + x.stream + "#" + x.id }
+func (x *delivery) Attempt() int   { return x.attempt }
 
 func (x *delivery) Ack(ctx context.Context) error {
 	pipe := x.d.c.TxPipeline()
@@ -325,4 +328,40 @@ func (x *delivery) Retry(ctx context.Context, delay time.Duration) error {
 func (x *delivery) Extend(ctx context.Context) error {
 	return x.d.c.XClaimJustID(ctx, &redis.XClaimArgs{Stream: x.stream, Group: x.d.cfg.Group, Consumer: x.d.cfg.Consumer,
 		MinIdle: 0, Messages: []string{x.id}}).Err()
+}
+
+// VersionStore keeps the newest version per key in Redis ("<prefix>:version:<key>"), raised atomically by a script.
+type VersionStore struct {
+	c      redis.UniversalClient
+	prefix string
+}
+
+// NewVersionStore returns versions under prefix (default "jobs").
+func NewVersionStore(c redis.UniversalClient, prefix string) *VersionStore {
+	if prefix == "" {
+		prefix = "jobs"
+	}
+	return &VersionStore{c: c, prefix: prefix}
+}
+
+var _ jobqueue.VersionStore = (*VersionStore)(nil)
+
+var raise = redis.NewScript(`local cur = redis.call("GET", KEYS[1])
+if not cur or tonumber(cur) < tonumber(ARGV[1]) then redis.call("SET", KEYS[1], ARGV[1]) end
+return 1`)
+
+func (v *VersionStore) key(k string) string {
+	return v.prefix + ":version:" + hex.EncodeToString([]byte(k))
+}
+
+func (v *VersionStore) Observe(ctx context.Context, key string, version int64) error {
+	return raise.Run(ctx, v.c, []string{v.key(key)}, version).Err()
+}
+
+func (v *VersionStore) Latest(ctx context.Context, key string) (int64, bool, error) {
+	n, err := v.c.Get(ctx, v.key(key)).Int64()
+	if errors.Is(err, redis.Nil) {
+		return 0, false, nil
+	}
+	return n, err == nil, err
 }

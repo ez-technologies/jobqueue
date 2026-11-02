@@ -104,6 +104,7 @@ func main() {
 	_ = q.Work(work, handlers, jobqueue.WorkOptions{
 		StopGrace: time.Second,
 		Backoff:   func(int) time.Duration { return time.Second },
+		Jitter:    -1,
 		Logger:    slog.New(slog.DiscardHandler),
 		OnDone: func(j jobqueue.Job, outcome string, err error, took time.Duration) {
 			switch outcome {

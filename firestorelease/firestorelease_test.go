@@ -25,4 +25,5 @@ func TestLease(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = c.Close() })
 	jobqueuetest.Lease(t, func(t *testing.T) jobqueue.Lease { return firestorelease.New(c, "jqtest_leases") })
+	jobqueuetest.Versions(t, func(t *testing.T) jobqueue.VersionStore { return firestorelease.NewVersionStore(c, "jqtest_versions") })
 }

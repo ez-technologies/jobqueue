@@ -90,3 +90,43 @@ func (l *Lease) Release(ctx context.Context, name, holder string) error {
 	}
 	return err
 }
+
+// VersionStore keeps the newest version per key in the same table (items "version#<key>"), raised by a
+// conditional update.
+type VersionStore struct{ l *Lease }
+
+// NewVersionStore returns versions in table (default "jobqueue_leases"; CreateTable makes it).
+func NewVersionStore(c *dynamodb.Client, table string) *VersionStore {
+	return &VersionStore{l: New(c, table)}
+}
+
+var _ jobqueue.VersionStore = (*VersionStore)(nil)
+
+func (v *VersionStore) Observe(ctx context.Context, key string, version int64) error {
+	_, err := v.l.c.UpdateItem(ctx, &dynamodb.UpdateItemInput{
+		TableName:                 aws.String(v.l.table),
+		Key:                       map[string]types.AttributeValue{"name": &types.AttributeValueMemberS{Value: "version#" + key}},
+		UpdateExpression:          aws.String("SET v = :v"),
+		ConditionExpression:       aws.String("attribute_not_exists(v) OR v < :v"),
+		ExpressionAttributeValues: map[string]types.AttributeValue{":v": &types.AttributeValueMemberN{Value: strconv.FormatInt(version, 10)}},
+	})
+	var failed *types.ConditionalCheckFailedException
+	if errors.As(err, &failed) {
+		return nil // a newer one is there
+	}
+	return err
+}
+
+func (v *VersionStore) Latest(ctx context.Context, key string) (int64, bool, error) {
+	out, err := v.l.c.GetItem(ctx, &dynamodb.GetItemInput{TableName: aws.String(v.l.table), ConsistentRead: aws.Bool(true),
+		Key: map[string]types.AttributeValue{"name": &types.AttributeValueMemberS{Value: "version#" + key}}})
+	if err != nil {
+		return 0, false, err
+	}
+	n, ok := out.Item["v"].(*types.AttributeValueMemberN)
+	if !ok {
+		return 0, false, nil
+	}
+	val, err := strconv.ParseInt(n.Value, 10, 64)
+	return val, err == nil, err
+}

@@ -60,3 +60,13 @@ func TestLease(t *testing.T) {
 		return l
 	})
 }
+
+func TestVersions(t *testing.T) {
+	jobqueuetest.Versions(t, func(t *testing.T) jobqueue.VersionStore {
+		v, err := natsq.NewVersionStore(context.Background(), js(t), "jqtest_versions")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	})
+}

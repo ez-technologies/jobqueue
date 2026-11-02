@@ -179,8 +179,15 @@ func group(m jobqueue.Message) string {
 }
 
 func dedup(m jobqueue.Message) string {
-	sum := sha256.Sum256([]byte(m.Kind + "\x00" + m.ID))
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%s\x00%d", m.Route(), m.ID, retryAttempt(m))))
 	return hex.EncodeToString(sum[:])
+}
+
+func retryAttempt(m jobqueue.Message) int {
+	if m.Retry != nil {
+		return m.Retry.Attempt
+	}
+	return 1
 }
 
 func clip(s string) string {
@@ -219,10 +226,10 @@ func (d *Driver) SendBatch(ctx context.Context, ms []jobqueue.Message) error {
 		if delay != nil {
 			e.DelaySeconds = *delay
 		}
-		if _, ok := byKind[m.Kind]; !ok {
-			order = append(order, m.Kind)
+		if _, ok := byKind[m.Route()]; !ok {
+			order = append(order, m.Route())
 		}
-		byKind[m.Kind] = append(byKind[m.Kind], e)
+		byKind[m.Route()] = append(byKind[m.Route()], e)
 	}
 	for _, kind := range order {
 		u, err := d.queueURL(ctx, kind)
@@ -250,7 +257,7 @@ func (d *Driver) Send(ctx context.Context, m jobqueue.Message, delay time.Durati
 	if delay > MaxDelay {
 		return fmt.Errorf("sqsq: delay %s over %s", delay, MaxDelay)
 	}
-	u, err := d.queueURL(ctx, m.Kind)
+	u, err := d.queueURL(ctx, m.Route())
 	if err != nil {
 		return err
 	}
@@ -299,7 +306,7 @@ func (d *Driver) ReceiveBatch(ctx context.Context, kind string, max int) ([]jobq
 			continue // not ours: left to the redrive policy
 		}
 		attempt, _ := strconv.Atoi(msg.Attributes[string(types.MessageSystemAttributeNameApproximateReceiveCount)])
-		ds = append(ds, &delivery{d: d, url: u, handle: aws.ToString(msg.ReceiptHandle), m: m, attempt: attempt})
+		ds = append(ds, &delivery{d: d, url: u, handle: aws.ToString(msg.ReceiptHandle), msgID: aws.ToString(msg.MessageId), m: m, attempt: attempt})
 	}
 	return ds, nil
 }
@@ -343,12 +350,16 @@ type delivery struct {
 	d       *Driver
 	url     string
 	handle  string
+	msgID   string
 	m       jobqueue.Message
 	attempt int
 }
 
 func (x *delivery) Message() jobqueue.Message { return x.m }
-func (x *delivery) Attempt() int              { return x.attempt }
+
+// Origin is the queue and the SQS message id.
+func (x *delivery) Origin() string { return "sqs:" + x.url + "#" + x.msgID }
+func (x *delivery) Attempt() int   { return x.attempt }
 
 func (x *delivery) Ack(ctx context.Context) error {
 	_, err := x.d.c.DeleteMessage(ctx, &sqs.DeleteMessageInput{QueueUrl: aws.String(x.url), ReceiptHandle: aws.String(x.handle)})
