@@ -32,9 +32,21 @@ CREATE TABLE IF NOT EXISTS jobqueue_done (
 	key     text PRIMARY KEY,
 	done_at timestamptz NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS jobqueue_done_at ON jobqueue_done (done_at);`
+CREATE INDEX IF NOT EXISTS jobqueue_done_at ON jobqueue_done (done_at);
+CREATE TABLE IF NOT EXISTS jobqueue_versions (
+	key     text PRIMARY KEY,
+	version bigint NOT NULL
+);
+CREATE TABLE IF NOT EXISTS jobqueue_parked (
+	kind      text NOT NULL,
+	key       text NOT NULL,
+	reason    text NOT NULL DEFAULT '',
+	parked_at timestamptz NOT NULL DEFAULT now(),
+	PRIMARY KEY (kind, key)
+);`
 
-// Migrate creates the tables.
+// Migrate creates the tables (jobqueue_scheduled, jobqueue_leases, jobqueue_done, jobqueue_versions,
+// jobqueue_parked).
 func Migrate(ctx context.Context, db *sql.DB) error {
 	_, err := db.ExecContext(ctx, Schema)
 	return err
@@ -151,4 +163,55 @@ func (l *DoneLog) Prune(ctx context.Context, age time.Duration) (int64, error) {
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// VersionStore keeps the newest version per key (Supersede).
+type VersionStore struct{ db *sql.DB }
+
+// NewVersionStore returns versions over db.
+func NewVersionStore(db *sql.DB) *VersionStore { return &VersionStore{db: db} }
+
+var _ jobqueue.VersionStore = (*VersionStore)(nil)
+
+func (v *VersionStore) Observe(ctx context.Context, key string, version int64) error {
+	_, err := v.db.ExecContext(ctx, `INSERT INTO jobqueue_versions (key, version) VALUES ($1, $2)
+		ON CONFLICT (key) DO UPDATE SET version = GREATEST(jobqueue_versions.version, EXCLUDED.version)`, key, version)
+	return err
+}
+
+func (v *VersionStore) Latest(ctx context.Context, key string) (int64, bool, error) {
+	var out int64
+	err := v.db.QueryRowContext(ctx, `SELECT version FROM jobqueue_versions WHERE key = $1`, key).Scan(&out)
+	if err == sql.ErrNoRows {
+		return 0, false, nil
+	}
+	return out, err == nil, err
+}
+
+// ParkStore keeps parked keys, shared by every worker.
+type ParkStore struct{ db *sql.DB }
+
+// NewParkStore returns parked keys over db.
+func NewParkStore(db *sql.DB) *ParkStore { return &ParkStore{db: db} }
+
+var _ jobqueue.ParkStore = (*ParkStore)(nil)
+
+func (p *ParkStore) Park(ctx context.Context, kind, key, reason string) error {
+	_, err := p.db.ExecContext(ctx, `INSERT INTO jobqueue_parked (kind, key, reason) VALUES ($1, $2, $3)
+		ON CONFLICT (kind, key) DO NOTHING`, kind, key, reason)
+	return err
+}
+
+func (p *ParkStore) Parked(ctx context.Context, kind, key string) (bool, error) {
+	var one int
+	err := p.db.QueryRowContext(ctx, `SELECT 1 FROM jobqueue_parked WHERE kind = $1 AND key = $2`, kind, key).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+func (p *ParkStore) Unpark(ctx context.Context, kind, key string) error {
+	_, err := p.db.ExecContext(ctx, `DELETE FROM jobqueue_parked WHERE kind = $1 AND key = $2`, kind, key)
+	return err
 }

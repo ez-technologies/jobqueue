@@ -71,3 +71,15 @@ func TestAStuckJobIsTakenOver(t *testing.T) {
 	}
 	t.Fatal("the stuck job was never taken over")
 }
+
+func TestVersions(t *testing.T) {
+	jobqueuetest.Versions(t, func(t *testing.T) jobqueue.VersionStore {
+		addr := os.Getenv("JOBQUEUE_TEST_REDIS_ADDR")
+		if addr == "" {
+			t.Skip("JOBQUEUE_TEST_REDIS_ADDR is not set")
+		}
+		c := redis.NewClient(&redis.Options{Addr: addr})
+		t.Cleanup(func() { _ = c.Close() })
+		return redisq.NewVersionStore(c, "jqtest")
+	})
+}

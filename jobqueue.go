@@ -47,6 +47,41 @@ type Message struct {
 	Key string `json:"key,omitempty"`
 	// Payload is the job's JSON.
 	Payload json.RawMessage `json:"payload,omitempty"`
+	// Lane, when set, sends the job to its kind's lane of that name (its own queue, workers and limits: see
+	// WorkOptions.Lanes), e.g. "slow" for one heavy job of a usually fast kind.
+	Lane string `json:"lane,omitempty"`
+	// Retry is set on a copy re-published after a failure.
+	Retry *RetryInfo `json:"retry,omitempty"`
+	// Entity and Version mark a state-sync job ("sync entity Y"): Version grows with every change of Entity (an event
+	// id, an update sequence). With WithVersions and Supersede, a retry older than the newest job published for its
+	// entity is skipped. Never for jobs where every one matters (a push, a payment, an email).
+	Entity  string `json:"entity,omitempty"`
+	Version int64  `json:"version,omitempty"`
+}
+
+// RetryInfo travels with a job re-published after a failure (the original is acknowledged at once).
+type RetryInfo struct {
+	// Attempt is the attempt this copy is (2 for the first retry).
+	Attempt int `json:"attempt"`
+	// Origin is where the job was first delivered from (driver specific: queue, topic/partition/offset, stream id).
+	Origin string `json:"origin,omitempty"`
+	// FirstFailedAt is when the first attempt failed; LastError what the last one said; NextAt when this copy is due.
+	FirstFailedAt time.Time `json:"first_failed_at"`
+	LastError     string    `json:"last_error,omitempty"`
+	NextAt        time.Time `json:"next_at"`
+}
+
+// Route is the queue a message travels on: its kind, or "<kind>.lane-<lane>" for a lane. Drivers route by it.
+func (m Message) Route() string {
+	if m.Lane == "" {
+		return m.Kind
+	}
+	return m.Kind + ".lane-" + m.Lane
+}
+
+// Originer is a Delivery that can say where it came from (for RetryInfo.Origin).
+type Originer interface {
+	Origin() string
 }
 
 // Job is a message being handled.
@@ -70,8 +105,9 @@ type Driver interface {
 	Send(ctx context.Context, m Message, delay time.Duration) error
 	// MaxDelay is the longest delay Send holds natively: 0 for none, Unlimited for any.
 	MaxDelay() time.Duration
-	// Receive waits a short while (a poll) for the next message of kind. It answers nil, nil when none came.
-	Receive(ctx context.Context, kind string) (Delivery, error)
+	// Receive waits a short while (a poll) for the next message of a route (a kind, or a kind's lane: Route). It
+	// answers nil, nil when none came.
+	Receive(ctx context.Context, route string) (Delivery, error)
 	// DeadLetter keeps a message that failed for good, with the last error.
 	DeadLetter(ctx context.Context, m Message, attempts int, cause error) error
 	// Close releases the driver's connections (not the client the caller gave it).
@@ -102,9 +138,10 @@ type BatchSender interface {
 	SendBatch(ctx context.Context, ms []Message) error
 }
 
-// BatchReceiver is a Driver that fetches up to max messages of kind in one call. Each is still acknowledged on its own.
+// BatchReceiver is a Driver that fetches up to max messages of a route in one call. Each is still acknowledged on its
+// own.
 type BatchReceiver interface {
-	ReceiveBatch(ctx context.Context, kind string, max int) ([]Delivery, error)
+	ReceiveBatch(ctx context.Context, route string, max int) ([]Delivery, error)
 }
 
 // Orderer is a Driver that keeps jobs with the same Key in order across all workers by itself. For other drivers the
@@ -119,7 +156,10 @@ var ErrNoScheduler = errors.New("jobqueue: this driver cannot hold the delay or 
 // ErrInvalidKind is returned for a kind with characters other than letters, digits, '.', '_' and '-'.
 var ErrInvalidKind = errors.New("jobqueue: invalid kind")
 
-var kindRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`)
+var (
+	kindRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`)
+	laneRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,30}$`)
+)
 
 // ValidKind reports whether kind may be used.
 func ValidKind(kind string) bool { return kindRE.MatchString(kind) }
@@ -148,14 +188,25 @@ func IsPermanent(err error) bool {
 type PublishOption func(*publishOptions)
 
 type publishOptions struct {
-	key   string
-	after time.Duration
-	at    time.Time
-	every time.Duration
+	key     string
+	lane    string
+	entity  string
+	version int64
+	after   time.Duration
+	at      time.Time
+	every   time.Duration
 }
 
 // Key orders the job among the jobs of its kind with the same key (see Message.Key).
 func Key(key string) PublishOption { return func(o *publishOptions) { o.key = key } }
+
+// Version marks the job as version v of entity (see Message.Version).
+func Version(entity string, v int64) PublishOption {
+	return func(o *publishOptions) { o.entity, o.version = entity, v }
+}
+
+// InLane sends the job to its kind's lane of that name (letters, digits, '_' and '-'), e.g. "slow".
+func InLane(lane string) PublishOption { return func(o *publishOptions) { o.lane = lane } }
 
 // After delays the job by d.
 func After(d time.Duration) PublishOption { return func(o *publishOptions) { o.after = d } }
@@ -169,9 +220,10 @@ func Every(d time.Duration) PublishOption { return func(o *publishOptions) { o.e
 
 // Queue publishes jobs and runs workers over a Driver.
 type Queue struct {
-	d     Driver
-	sched *Scheduler
-	now   func() time.Time
+	d        Driver
+	sched    *Scheduler
+	now      func() time.Time
+	versions VersionStore
 }
 
 // Option configures a Queue.
@@ -179,6 +231,9 @@ type Option func(*Queue)
 
 // WithScheduler holds delays and repeats the driver cannot (see Scheduler). Its loop runs inside Work.
 func WithScheduler(s *Scheduler) Option { return func(q *Queue) { q.sched = s } }
+
+// WithVersions records the newest version published per entity (jobs published with Version), for Supersede.
+func WithVersions(v VersionStore) Option { return func(q *Queue) { q.versions = v } }
 
 // WithClock sets the clock used for At and the scheduler (tests).
 func WithClock(now func() time.Time) Option { return func(q *Queue) { q.now = now } }
@@ -219,7 +274,25 @@ func (q *Queue) Publish(ctx context.Context, kind, id string, payload any, opts 
 	for _, opt := range opts {
 		opt(&o)
 	}
-	m := Message{ID: id, Kind: kind, Key: o.key, Payload: raw}
+	if o.lane != "" && !laneRE.MatchString(o.lane) {
+		return fmt.Errorf("jobqueue: invalid lane %q", o.lane)
+	}
+	m := Message{ID: id, Kind: kind, Key: o.key, Lane: o.lane, Entity: o.entity, Version: o.version, Payload: raw}
+	if err := q.publish(ctx, m, o); err != nil {
+		return err
+	}
+	return q.observe(ctx, m)
+}
+
+// observe records a published job's version (WithVersions).
+func (q *Queue) observe(ctx context.Context, m Message) error {
+	if q.versions == nil || m.Entity == "" {
+		return nil
+	}
+	return q.versions.Observe(ctx, m.Kind+"\x00"+m.Entity, m.Version)
+}
+
+func (q *Queue) publish(ctx context.Context, m Message, o publishOptions) error {
 	if o.every > 0 {
 		if o.every < time.Second {
 			return errors.New("jobqueue: Every must be at least one second")
@@ -250,8 +323,10 @@ func (q *Queue) Publish(ctx context.Context, kind, id string, payload any, opts 
 
 // Pub is one job of PublishBatch.
 type Pub struct {
-	Kind, ID, Key string
-	Payload       any
+	Kind, ID, Key, Lane string
+	Entity              string
+	Version             int64
+	Payload             any
 }
 
 func marshal(payload any) (json.RawMessage, error) {
@@ -283,13 +358,24 @@ func (q *Queue) PublishBatch(ctx context.Context, jobs []Pub) error {
 		if err != nil {
 			return err
 		}
-		ms = append(ms, Message{ID: j.ID, Kind: j.Kind, Key: j.Key, Payload: raw})
+		if j.Lane != "" && !laneRE.MatchString(j.Lane) {
+			return fmt.Errorf("jobqueue: invalid lane %q", j.Lane)
+		}
+		ms = append(ms, Message{ID: j.ID, Kind: j.Kind, Key: j.Key, Lane: j.Lane, Entity: j.Entity, Version: j.Version, Payload: raw})
 	}
 	if b, ok := q.d.(BatchSender); ok {
-		return b.SendBatch(ctx, ms)
+		if err := b.SendBatch(ctx, ms); err != nil {
+			return err
+		}
+	} else {
+		for _, m := range ms {
+			if err := q.d.Send(ctx, m, 0); err != nil {
+				return err
+			}
+		}
 	}
 	for _, m := range ms {
-		if err := q.d.Send(ctx, m, 0); err != nil {
+		if err := q.observe(ctx, m); err != nil {
 			return err
 		}
 	}

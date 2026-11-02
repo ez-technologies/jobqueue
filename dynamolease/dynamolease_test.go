@@ -27,4 +27,5 @@ func TestLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	jobqueuetest.Lease(t, func(t *testing.T) jobqueue.Lease { return l })
+	jobqueuetest.Versions(t, func(t *testing.T) jobqueue.VersionStore { return dynamolease.NewVersionStore(c, "jqtest_leases") })
 }

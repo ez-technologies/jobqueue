@@ -280,6 +280,7 @@ func Driver(t *testing.T, newDriver func(t *testing.T) jobqueue.Driver) {
 	})
 	t.Run("KeyedJobsRunOneAtATimeInPublishOrder", func(t *testing.T) { Ordering(t, newDriver) })
 	t.Run("BatchesArePublishedFetchedAndSettledOneByOne", func(t *testing.T) { Batches(t, newDriver) })
+	t.Run("Flow", func(t *testing.T) { Flow(t, newDriver) })
 }
 
 // Ordering publishes interleaved jobs for three keys and checks that each key's jobs ran one at a time, in publish

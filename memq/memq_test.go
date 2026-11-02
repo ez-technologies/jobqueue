@@ -27,3 +27,11 @@ func TestDoneLog(t *testing.T) {
 func TestSchedulerOver(t *testing.T) {
 	jobqueuetest.SchedulerOver(t, memq.New(), memq.NewStore(), memq.NewLease())
 }
+
+func TestVersions(t *testing.T) {
+	jobqueuetest.Versions(t, func(t *testing.T) jobqueue.VersionStore { return jobqueue.NewMemoryVersions() })
+}
+
+func TestParking(t *testing.T) {
+	jobqueuetest.Parking(t, func(t *testing.T) jobqueue.ParkStore { return jobqueue.NewMemoryParkStore() })
+}

@@ -19,7 +19,7 @@ up)
   # The cookie is given as an argument: some hosts refuse the file the image writes (eacces).
   run rabbitmq -p 127.0.0.1:5673:5672 -e RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS="-setcookie jobqueuetest" \
     -e RABBITMQ_CTL_ERL_ARGS="-setcookie jobqueuetest" rabbitmq:4.1-alpine
-  run kafka -p 127.0.0.1:19093:19093 redpandadata/redpanda:v25.2.9 redpanda start --mode dev-container --smp 1 \
+  run kafka -p 127.0.0.1:19093:19093 --ulimit nofile=65536:65536 redpandadata/redpanda:v25.2.9 redpanda start --mode dev-container --smp 1 \
     --kafka-addr internal://0.0.0.0:9092,external://0.0.0.0:19093 \
     --advertise-kafka-addr internal://localhost:9092,external://127.0.0.1:19093
   run postgres -p 127.0.0.1:5551:5432 -e POSTGRES_PASSWORD=test -e POSTGRES_DB=jobqueue postgres:16-alpine
@@ -30,6 +30,9 @@ up)
       && docker exec $P-kafka rpk cluster health 2>/dev/null | grep -q 'Healthy:.*true' && break
     sleep 1
   done
+  # A test makes many small topics: let Redpanda's small dev-container memory hold them.
+  docker exec $P-kafka rpk cluster config set topic_memory_per_partition 16384 >/dev/null 2>&1 || true
+  docker exec $P-kafka rpk cluster config set topic_fds_per_partition 1 >/dev/null 2>&1 || true
   cat <<VARS
 export JOBQUEUE_TEST_NATS_URL=nats://127.0.0.1:4231
 export JOBQUEUE_TEST_SQS_ENDPOINT=http://127.0.0.1:9331

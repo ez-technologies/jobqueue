@@ -70,3 +70,11 @@ func TestPruneAndMigrateTwice(t *testing.T) {
 		t.Fatal("a pruned key can be claimed again")
 	}
 }
+
+func TestVersions(t *testing.T) {
+	jobqueuetest.Versions(t, func(t *testing.T) jobqueue.VersionStore { return pgq.NewVersionStore(db(t)) })
+}
+
+func TestParking(t *testing.T) {
+	jobqueuetest.Parking(t, func(t *testing.T) jobqueue.ParkStore { return pgq.NewParkStore(db(t)) })
+}

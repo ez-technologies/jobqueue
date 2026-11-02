@@ -97,11 +97,11 @@ func (d *Driver) lane(kind string, n int) string {
 
 func (d *Driver) target(m jobqueue.Message) string {
 	if m.Key == "" {
-		return d.queue(m.Kind)
+		return d.queue(m.Route())
 	}
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(m.Key))
-	return d.lane(m.Kind, int(h.Sum32()%uint32(d.cfg.KeyShards)))
+	return d.lane(m.Route(), int(h.Sum32()%uint32(d.cfg.KeyShards)))
 }
 
 // declare makes a queue once, on the publishing channel.
@@ -194,7 +194,7 @@ func (d *Driver) publish(ctx context.Context, msgs []out) error {
 }
 
 func (d *Driver) outFor(m jobqueue.Message, attempt int, delay time.Duration) (out, error) {
-	if err := d.declareKind(m.Kind); err != nil {
+	if err := d.declareKind(m.Route()); err != nil {
 		return out{}, err
 	}
 	o := out{queue: d.target(m), m: m, hdr: amqp.Table{"jobqueue-attempt": int32(attempt)}}

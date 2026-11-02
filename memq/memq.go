@@ -126,7 +126,7 @@ func (d *Driver) push(it item) {
 	if d.closed {
 		return
 	}
-	d.ready[it.m.Kind] = append(d.ready[it.m.Kind], it)
+	d.ready[it.m.Route()] = append(d.ready[it.m.Route()], it)
 	close(d.wake)
 	d.wake = make(chan struct{})
 }
@@ -254,7 +254,7 @@ func (x *delivery) Retry(_ context.Context, delay time.Duration) error {
 	if x.it.m.Key != "" && delay <= 0 {
 		// A keyed message goes back to the front, ahead of the ones that follow it.
 		x.d.mu.Lock()
-		x.d.ready[next.m.Kind] = append([]item{next}, x.d.ready[next.m.Kind]...)
+		x.d.ready[next.m.Route()] = append([]item{next}, x.d.ready[next.m.Route()]...)
 		x.d.mu.Unlock()
 		x.d.done(x.it.m)
 		return nil

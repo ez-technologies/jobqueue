@@ -157,7 +157,7 @@ func (d *Driver) Send(ctx context.Context, m jobqueue.Message, delay time.Durati
 	if delay > 0 {
 		return errors.New("pubsubq: Pub/Sub holds no delay; give the Queue a Scheduler")
 	}
-	if err := d.prepare(ctx, m.Kind); err != nil {
+	if err := d.prepare(ctx, m.Route()); err != nil {
 		return err
 	}
 	return d.SendBatch(ctx, []jobqueue.Message{m})
@@ -184,10 +184,10 @@ func (d *Driver) SendBatch(ctx context.Context, ms []jobqueue.Message) error {
 		if err != nil {
 			return err
 		}
-		if _, ok := byKind[m.Kind]; !ok {
-			order = append(order, m.Kind)
+		if _, ok := byKind[m.Route()]; !ok {
+			order = append(order, m.Route())
 		}
-		byKind[m.Kind] = append(byKind[m.Kind], pm)
+		byKind[m.Route()] = append(byKind[m.Route()], pm)
 	}
 	for _, kind := range order {
 		if err := d.prepare(ctx, kind); err != nil {
@@ -239,7 +239,7 @@ func (d *Driver) ReceiveBatch(ctx context.Context, kind string, max int) ([]jobq
 		if attempt == 0 {
 			attempt = d.countAttempt(m.ID)
 		}
-		ds = append(ds, &delivery{d: d, sub: d.subscription(kind), ackID: rm.AckId, m: m, attempt: attempt})
+		ds = append(ds, &delivery{d: d, sub: d.subscription(kind), ackID: rm.AckId, msgID: rm.Message.GetMessageId(), m: m, attempt: attempt})
 	}
 	return ds, nil
 }
@@ -287,12 +287,16 @@ type delivery struct {
 	d       *Driver
 	sub     string
 	ackID   string
+	msgID   string
 	m       jobqueue.Message
 	attempt int
 }
 
 func (x *delivery) Message() jobqueue.Message { return x.m }
-func (x *delivery) Attempt() int              { return x.attempt }
+
+// Origin is the subscription and the Pub/Sub message id.
+func (x *delivery) Origin() string { return "pubsub:" + x.sub + "#" + x.msgID }
+func (x *delivery) Attempt() int   { return x.attempt }
 
 func (x *delivery) Ack(ctx context.Context) error {
 	err := x.d.sub.Acknowledge(ctx, &pubsubpb.AcknowledgeRequest{Subscription: x.sub, AckIds: []string{x.ackID}})

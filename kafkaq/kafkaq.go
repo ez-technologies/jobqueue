@@ -7,10 +7,11 @@
 //     with its key (in this partition) is still running: per-key order across all workers.
 //   - Offsets are committed per partition only up to the first job not yet done, so a crash redelivers everything
 //     unfinished (at least once). One slow job holds back the commit (not the work) of its partition.
-//   - A retry is a new record on "<prefix>.<kind>.retry" with the attempt and a not-before time; the driver reads it
-//     in order, waits until it is due, and puts it back on the kind's topic. Retries in that topic are head-of-line:
-//     a long back-off delays shorter ones behind it.
-//   - Dead letters go to "<prefix>.dead". Delays and repeats go through the Queue's Scheduler (MaxDelay is 0).
+//   - A retry or a delayed job is a record on a retry tier, "<prefix>.<kind>.retry-<tier>" (default 5s, 1m0s, 10m0s:
+//     the smallest tier at least as long as the delay), with a not-before time; the driver reads each tier in order,
+//     waits until a record is due and puts it back on the kind's topic. All records of a tier wait about as long, so
+//     none holds up a shorter one; delays beyond the last tier go through the Queue's Scheduler.
+//   - Dead letters go to "<prefix>.dead".
 package kafkaq
 
 import (
@@ -19,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -44,6 +46,8 @@ type Config struct {
 	ReplicationFactor int16
 	// Poll is how long Receive waits (default 2s).
 	Poll time.Duration
+	// RetryTiers are the retry topics' delays (default 5s, 1m, 10m); MaxDelay is the last.
+	RetryTiers []time.Duration
 }
 
 // Driver is the Kafka driver.
@@ -51,10 +55,11 @@ type Driver struct {
 	cfg  Config
 	prod *kgo.Client
 
-	mu     sync.Mutex
-	kinds  map[string]*consumer
-	topics map[string]bool
-	closed bool
+	mu       sync.Mutex
+	createMu sync.Mutex
+	kinds    map[string]*consumer
+	topics   map[string]bool
+	closed   bool
 }
 
 var (
@@ -81,6 +86,10 @@ func New(cfg Config) (*Driver, error) {
 	if cfg.Poll <= 0 {
 		cfg.Poll = 2 * time.Second
 	}
+	if len(cfg.RetryTiers) == 0 {
+		cfg.RetryTiers = []time.Duration{5 * time.Second, time.Minute, 10 * time.Minute}
+	}
+	sort.Slice(cfg.RetryTiers, func(i, j int) bool { return cfg.RetryTiers[i] < cfg.RetryTiers[j] })
 	opts := append([]kgo.Opt{kgo.SeedBrokers(cfg.Brokers...), kgo.RecordPartitioner(kgo.StickyKeyPartitioner(nil)),
 		kgo.ProducerLinger(5 * time.Millisecond)}, cfg.Options...)
 	prod, err := kgo.NewClient(opts...)
@@ -95,19 +104,44 @@ var unsafe = regexp.MustCompile(`[^A-Za-z0-9._-]`)
 func (d *Driver) topic(kind string) string {
 	return unsafe.ReplaceAllString(d.cfg.Prefix+"."+kind, "_")
 }
-func (d *Driver) retry(kind string) string { return d.topic(kind) + ".retry" }
-func (d *Driver) dead() string             { return d.cfg.Prefix + ".dead" }
+
+// tiers are the retry topics of a route, shortest delay first.
+func (d *Driver) tiers(route string) []string {
+	out := make([]string, len(d.cfg.RetryTiers))
+	for i, t := range d.cfg.RetryTiers {
+		out[i] = d.topic(route) + ".retry-" + t.String()
+	}
+	return out
+}
+
+// tierFor is the retry topic for a delay: the smallest tier at least as long, else the last.
+func (d *Driver) tierFor(route string, delay time.Duration) string {
+	ts := d.tiers(route)
+	for i, t := range d.cfg.RetryTiers {
+		if t >= delay {
+			return ts[i]
+		}
+	}
+	return ts[len(ts)-1]
+}
+
+func (d *Driver) topicsOf(route string) []string {
+	return append([]string{d.topic(route)}, d.tiers(route)...)
+}
+func (d *Driver) dead() string { return d.cfg.Prefix + ".dead" }
 
 // OrdersByKey is true (record key = job key, one running record per key and partition).
 func (d *Driver) OrdersByKey() bool { return true }
 
-// MaxDelay is 0: Kafka holds no delay.
-func (d *Driver) MaxDelay() time.Duration { return 0 }
+// MaxDelay is the last retry tier (10 minutes by default).
+func (d *Driver) MaxDelay() time.Duration { return d.cfg.RetryTiers[len(d.cfg.RetryTiers)-1] }
 
 func (d *Driver) ensure(ctx context.Context, topics ...string) error {
 	if !d.cfg.CreateTopics {
 		return nil
 	}
+	d.createMu.Lock() // one creation at a time: brokers answer concurrent creations of a topic oddly
+	defer d.createMu.Unlock()
 	d.mu.Lock()
 	var missing []string
 	for _, t := range topics {
@@ -119,13 +153,24 @@ func (d *Driver) ensure(ctx context.Context, topics ...string) error {
 	if len(missing) == 0 {
 		return nil
 	}
-	res, err := kadm.NewClient(d.prod).CreateTopics(ctx, d.cfg.Partitions, d.cfg.ReplicationFactor, nil, missing...)
+	adm := kadm.NewClient(d.prod)
+	res, err := adm.CreateTopics(ctx, d.cfg.Partitions, d.cfg.ReplicationFactor, nil, missing...)
 	if err != nil {
 		return err
 	}
+	var failed []string
 	for _, r := range res {
 		if r.Err != nil && !isExists(r.Err) {
-			return fmt.Errorf("kafkaq: create %s: %w", r.Topic, r.Err)
+			failed = append(failed, r.Topic)
+		}
+	}
+	if len(failed) > 0 {
+		// Perhaps made meanwhile by another process: they count if the broker lists them.
+		listed, lerr := adm.ListTopics(ctx, failed...)
+		for _, t := range failed {
+			if lerr != nil || !listed.Has(t) {
+				return fmt.Errorf("kafkaq: create %s: %w", t, res[t].Err)
+			}
 		}
 	}
 	d.mu.Lock()
@@ -163,22 +208,29 @@ func header(r *kgo.Record, key string) string {
 	return ""
 }
 
-// Send produces m to its kind's topic (delay must be 0).
+// Send produces m to its kind's topic, or to a retry tier when delayed.
 func (d *Driver) Send(ctx context.Context, m jobqueue.Message, delay time.Duration) error {
-	if delay > 0 {
-		return errors.New("kafkaq: Kafka holds no delay; give the Queue a Scheduler")
+	if delay <= 0 {
+		return d.SendBatch(ctx, []jobqueue.Message{m})
 	}
-	return d.SendBatch(ctx, []jobqueue.Message{m})
+	if err := d.ensure(ctx, d.topicsOf(m.Route())...); err != nil {
+		return err
+	}
+	r, err := record(d.tierFor(m.Route(), delay), m, 1, time.Now().Add(delay))
+	if err != nil {
+		return err
+	}
+	return d.prod.ProduceSync(ctx, r).FirstErr()
 }
 
 // SendBatch produces all messages and waits for every acknowledgement.
 func (d *Driver) SendBatch(ctx context.Context, ms []jobqueue.Message) error {
 	rs := make([]*kgo.Record, 0, len(ms))
 	for _, m := range ms {
-		if err := d.ensure(ctx, d.topic(m.Kind), d.retry(m.Kind)); err != nil {
+		if err := d.ensure(ctx, d.topicsOf(m.Route())...); err != nil {
 			return err
 		}
-		r, err := record(d.topic(m.Kind), m, 1, time.Time{})
+		r, err := record(d.topic(m.Route()), m, 1, time.Time{})
 		if err != nil {
 			return err
 		}
@@ -276,13 +328,13 @@ func (d *Driver) consumer(ctx context.Context, kind string) (*consumer, error) {
 	if closed {
 		return nil, errors.New("kafkaq: closed")
 	}
-	if err := d.ensure(ctx, d.topic(kind), d.retry(kind)); err != nil {
+	if err := d.ensure(ctx, d.topicsOf(kind)...); err != nil {
 		return nil, err
 	}
 	c = &consumer{d: d, kind: kind, waiting: map[string][]*delivery{}, running: map[string]bool{}, tracks: map[tp]*track{},
 		wake: make(chan struct{}), done: make(chan struct{})}
 	opts := append([]kgo.Opt{kgo.SeedBrokers(d.cfg.Brokers...), kgo.ConsumerGroup(d.topic(kind)),
-		kgo.ConsumeTopics(d.topic(kind), d.retry(kind)), kgo.DisableAutoCommit(),
+		kgo.ConsumeTopics(d.topicsOf(kind)...), kgo.DisableAutoCommit(),
 		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
 		kgo.OnPartitionsRevoked(c.revoked), kgo.OnPartitionsLost(c.revoked)}, d.cfg.Options...)
 	cl, err := kgo.NewClient(opts...)
@@ -329,8 +381,12 @@ func (c *consumer) signal() {
 
 func (c *consumer) poll(ctx context.Context) {
 	defer close(c.done)
-	retries := make(chan *kgo.Record, 1000)
-	go c.retries(ctx, retries)
+	tiers := map[string]chan *kgo.Record{}
+	for _, t := range c.d.tiers(c.kind) {
+		ch := make(chan *kgo.Record, 1000)
+		tiers[t] = ch
+		go c.retries(ctx, ch) // one per tier: a tier's records wait about as long as each other
+	}
 	for ctx.Err() == nil {
 		fs := c.cl.PollRecords(ctx, 500)
 		fs.EachRecord(func(r *kgo.Record) {
@@ -343,9 +399,9 @@ func (c *consumer) poll(ctx context.Context) {
 			t.offsets = append(t.offsets, r.Offset)
 			t.epoch = r.LeaderEpoch
 			c.mu.Unlock()
-			if r.Topic == c.d.retry(c.kind) {
+			if ch, ok := tiers[r.Topic]; ok {
 				select {
-				case retries <- r:
+				case ch <- r:
 				case <-ctx.Done():
 				}
 				return
@@ -491,7 +547,12 @@ type delivery struct {
 	attempt int
 }
 
-func (x *delivery) Message() jobqueue.Message    { return x.m }
+func (x *delivery) Message() jobqueue.Message { return x.m }
+
+// Origin is the topic, partition and offset the job was read from.
+func (x *delivery) Origin() string {
+	return fmt.Sprintf("kafka:%s/%d@%d", x.r.Topic, x.r.Partition, x.r.Offset)
+}
 func (x *delivery) Attempt() int                 { return x.attempt }
 func (x *delivery) Extend(context.Context) error { return nil }
 
@@ -512,7 +573,7 @@ func (x *delivery) Retry(ctx context.Context, delay time.Duration) error {
 		x.c.mu.Unlock()
 		return nil
 	}
-	r, err := record(x.c.d.retry(x.c.kind), x.m, x.attempt+1, time.Now().Add(delay))
+	r, err := record(x.c.d.tierFor(x.c.kind, delay), x.m, x.attempt+1, time.Now().Add(delay))
 	if err != nil {
 		return err
 	}
