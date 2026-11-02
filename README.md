@@ -7,7 +7,10 @@
   delayed and repeating jobs, panics caught, and a **graceful stop on SIGTERM** within a deadline (spot and preemptible
   machines get about 30 seconds).
 - One adapter per platform, each in its own package, so your binary links only the SDK it uses:
-  **NATS JetStream**, **AWS SQS**, **Google Cloud Pub/Sub**, and **in memory** for tests.
+  **NATS JetStream**, **Kafka** (Apache Kafka, AWS MSK, Confluent, Redpanda), **RabbitMQ** (Amazon MQ, CloudAMQP),
+  **Redis / Valkey Streams**, **AWS SQS**, **Google Cloud Pub/Sub**, and **in memory** for tests.
+- Unordered by default, for throughput; an optional **ordering key** runs a key's jobs one at a time in publish order.
+- **Batches**: publish in batches, fetch in batches, acknowledge each job on its own; an optional batch handler.
 - Delays a broker cannot hold go through a **scheduler loop**; one worker runs it at a time, chosen by a pluggable
   **lease**: PostgreSQL, NATS KV, DynamoDB or Firestore.
 - An idempotency helper (`Once` with a done-log) so a job delivered twice does not send two emails.
@@ -26,11 +29,15 @@
   - [Stop gracefully on SIGTERM (spot machines)](#stop-gracefully-on-sigterm-spot-machines)
   - [Do it once: idempotent handlers](#do-it-once-idempotent-handlers)
   - [Run only some kinds in a worker](#run-only-some-kinds-in-a-worker)
+  - [Order jobs by key](#order-jobs-by-key)
+  - [Batches](#batches)
   - [Test your handlers](#test-your-handlers)
   - [Write an adapter](#write-an-adapter)
 - [Run it on: local / AWS / Google](#run-it-on-local--aws--google)
 - [Options](#options)
 - [Adapters at a glance](#adapters-at-a-glance)
+- [Kafka: what is emulated](#kafka-what-is-emulated)
+- [Throughput](#throughput)
 - [Run the demo](#run-the-demo)
 - [Development](#development)
 
@@ -49,7 +56,10 @@ Import the root package and the adapters you use:
 | `jobqueue` | the queue, the worker runtime, the scheduler, `Once` | none |
 | `jobqueue/natsq` | NATS JetStream driver and a NATS KV lease | `nats.go` |
 | `jobqueue/memq` | in-memory driver, store, lease and done-log | none |
-| `jobqueue/sqsq` | AWS SQS driver | `aws-sdk-go-v2/service/sqs` |
+| `jobqueue/kafkaq` | Kafka driver (Apache Kafka, MSK, Confluent, Redpanda) | `franz-go` |
+| `jobqueue/rabbitq` | RabbitMQ driver (AMQP 0-9-1; Amazon MQ, CloudAMQP) | `amqp091-go` |
+| `jobqueue/redisq` | Redis / Valkey Streams driver | `go-redis/v9` |
+| `jobqueue/sqsq` | AWS SQS driver (standard or FIFO queues) | `aws-sdk-go-v2/service/sqs` |
 | `jobqueue/pubsubq` | Google Cloud Pub/Sub driver | `cloud.google.com/go/pubsub/v2` |
 | `jobqueue/pgq` | PostgreSQL scheduler store, lease and done-log (`database/sql`) | none (bring a driver) |
 | `jobqueue/dynamolease` | DynamoDB lease | `aws-sdk-go-v2/service/dynamodb` |
@@ -176,6 +186,54 @@ Prune old keys from a daily job: `done.Prune(ctx, 7*24*time.Hour)`.
 Each kind has its own consumer (NATS), queue (SQS) or subscription (Pub/Sub), shared by every worker that handles
 it. Start a worker with the handlers it should run: a small machine for `push.*`, a big one for `video.encode`.
 
+### Order jobs by key
+
+There is **no global order**: delivery is at least once and unordered by default, which is what lets many workers
+go fast. Make handlers idempotent. When a stream of jobs about one thing must not overtake each other, give them a
+key:
+
+```go
+q.Publish(ctx, "account.apply", "evt-981", ev, jobqueue.Key("account-17"))
+```
+
+Jobs of a kind with the same key run one at a time, in publish order. A keyed job that fails is retried **in place**
+(its followers wait) until it succeeds or goes to the dead letters. How each driver keeps the order:
+
+| Driver | Mapping | Across all workers? |
+|---|---|---|
+| `kafkaq` | the key is the record key (one partition); the driver holds back a record while an earlier one with its key runs | yes |
+| `sqsq` with `FIFO: true` | the key is the `MessageGroupId` | yes |
+| `rabbitq` | `KeyShards` lanes per kind, each a quorum queue with a single active consumer and a prefetch of 1 | yes |
+| `natsq` | `KeyShards` lanes per kind (subjects `<prefix>.key.<n>.<kind>`), each a consumer with `MaxAckPending` 1 | yes |
+| `memq` | the driver holds back a key's next job | yes (one process) |
+| `pubsubq` with `Ordering: true` | the key is the ordering key; Pub/Sub delivers a key's messages in order | within one worker process (keyed lock) |
+| `redisq`, `sqsq` standard | none in the broker | within one worker process only (a keyed lock in the runtime) |
+
+A lane or key that is busy does not slow other keys (except that lanes are shared by the keys hashed to them).
+Keyed jobs on `natsq` and `rabbitq` may wait up to one poll when the kind has no unkeyed jobs.
+
+### Batches
+
+```go
+// Publish in few round trips: SQS SendMessageBatch (10 per call), a NATS async publish window, Kafka and Pub/Sub
+// batches, a Redis pipeline, RabbitMQ with all confirms awaited together.
+err := q.PublishBatch(ctx, []jobqueue.Pub{{Kind: "push.send", ID: "p1", Payload: a}, {Kind: "push.send", ID: "p2", Payload: b}})
+
+// Fetch up to 50 at a time, run up to 32 at once; each is acknowledged on its own.
+q.Work(ctx, handlers, jobqueue.WorkOptions{BatchSize: 50, Concurrency: 32})
+
+// Or hand a whole batch to one call (send many pushes concurrently, delete many files), with a result per job:
+q.Work(ctx, nil, jobqueue.WorkOptions{BatchSize: 100, BatchHandlers: map[string]jobqueue.BatchHandler{
+	"files.delete": func(ctx context.Context, jobs []jobqueue.Job) []error {
+		errs := make([]error, len(jobs))
+		// ... errs[i] = nil when jobs[i] is done
+		return errs
+	},
+}})
+```
+
+One bad job in a batch fails only itself: it is retried or dead-lettered alone.
+
 ### Test your handlers
 
 ```go
@@ -202,7 +260,7 @@ func TestDriver(t *testing.T) {
 
 | | Local or any host | AWS | Google Cloud |
 |---|---|---|---|
-| Driver | `natsq` (NATS 2.12+, JetStream on) | `sqsq` (standard queues) | `pubsubq` |
+| Driver | `natsq` (NATS 2.12+, JetStream on), `kafkaq`, `rabbitq`, `redisq` | `sqsq`, or `kafkaq` on MSK, `rabbitq` on Amazon MQ, `redisq` on ElastiCache | `pubsubq`, or `redisq` on Memorystore, `kafkaq` on Confluent |
 | Delays | native, any length | native up to 15 min, longer by the scheduler | by the scheduler |
 | Scheduler store | not needed (or `pgq`) | `pgq` (RDS / Aurora PostgreSQL) | `pgq` (Cloud SQL PostgreSQL) |
 | Lease | not needed (or `natsq.NewLease`, `pgq`) | `dynamolease` or `pgq` | `firestorelease` or `pgq` |
@@ -224,6 +282,42 @@ allowed) and `JOBS_DEAD`. With NATS accounts, the app and workers need publish a
 for the KV lease. JetStream data holds only jobs in flight; whether to back it up depends on whether your jobs can be
 rebuilt from your database.
 
+### Kafka (Apache Kafka, MSK, Confluent, Redpanda)
+
+```go
+driver, err := kafkaq.New(kafkaq.Config{Brokers: []string{"broker-1:9092"}, Prefix: "jobs", CreateTopics: true,
+	Options: []kgo.Opt{ /* kgo.DialTLSConfig(...), kgo.SASL(...) for MSK IAM or Confluent */ }})
+```
+
+Topics `<prefix>.<kind>` and `<prefix>.<kind>.retry` (`Partitions`, default 6), `<prefix>.dead`; consumer groups
+`<prefix>.<kind>`. ACLs: `WRITE` and `DESCRIBE` on those topics, `READ` on the kind and retry topics, `READ` on the
+groups, and `CREATE` on the cluster for `CreateTopics` (or create the topics yourself). On MSK with IAM:
+`kafka-cluster:Connect`, `DescribeTopic`, `ReadData`, `WriteData`, `AlterGroup`, `DescribeGroup`, and `CreateTopic`.
+Delays and repeats need a Scheduler.
+
+### RabbitMQ (Amazon MQ, CloudAMQP)
+
+```go
+conn, _ := amqp.Dial("amqps://user:pass@host:5671/vhost")
+driver, err := rabbitq.New(conn, rabbitq.Config{Prefix: "jobs", Prefetch: 20, KeyShards: 4})
+```
+
+Queues (in the default exchange): `<prefix>.<kind>` and `<prefix>.<kind>.k<n>` (quorum), `<prefix>.wait.*` (classic,
+self-deleting), `<prefix>.dead`. User permissions on the vhost: configure, write and read on `^<prefix>\..*`.
+Quorum queues need RabbitMQ 3.8 or later (Amazon MQ for RabbitMQ 3.13+ supports them). Jobs that run longer than the
+broker's `consumer_timeout` (30 minutes by default) are redelivered.
+
+### Redis / Valkey Streams (your own, ElastiCache, Memorystore)
+
+```go
+driver := redisq.New(redis.NewClient(&redis.Options{Addr: addr}), redisq.Config{Prefix: "jobs"})
+```
+
+Keys `<prefix>:<kind>` (streams, consumer group `workers`), `<prefix>:delayed` (sorted set), `<prefix>:dead`. Redis
+5.0 or later; `XAUTOCLAIM` needs 6.2. With ACLs: `~<prefix>:* +@stream +zadd +zrangebyscore +zrem +evalsha +eval`.
+Cluster mode: one kind's keys may live on different shards, which is fine (the delay script touches one stream per
+job; give `<prefix>` a hash tag such as `{jobs}` to keep them on one shard if your provider requires it for scripts).
+
 ### AWS (SQS, DynamoDB)
 
 ```go
@@ -240,6 +334,9 @@ IAM permissions (resource `arn:aws:sqs:<region>:<account>:jobs-*`):
 | workers | also `sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:ChangeMessageVisibility` |
 | with `CreateQueues: true` | also `sqs:CreateQueue`, `sqs:SetQueueAttributes` (or create the queues with your infrastructure code and leave it false) |
 | `dynamolease` | `dynamodb:PutItem`, `dynamodb:DeleteItem` on `arn:aws:dynamodb:<region>:<account>:table/jobqueue_leases`; `dynamodb:CreateTable`, `dynamodb:UpdateTimeToLive` only for `CreateTable` |
+
+With `FIFO: true` the queues are `<prefix>-<kind>.fifo` (needs FIFO-capable permissions on `jobs-*.fifo`), a job's Key
+is its message group, ids are de-duplicated for 5 minutes, and delays go through the Scheduler.
 
 Queues: `<prefix>-<kind>` (dots become `_`) with a redrive policy to `<prefix>-<kind>-dead` after `MaxReceives`
 (50) receives, for messages that crash every worker. The DynamoDB table has the string key `name`; turn on TTL on `ttl`.
@@ -277,7 +374,9 @@ behind PgBouncer in transaction mode, RDS Proxy and Cloud SQL managed pooling.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `Concurrency` | 1 | jobs of each kind running at once in this process |
+| `Concurrency` | 1 | jobs of each kind running at once in this process (for a batch handler: batches) |
+| `BatchSize` | 1 | jobs one fetch may take (up to the idle handlers); the batch size of a batch handler |
+| `BatchHandlers` | none | kinds handled a batch at a time |
 | `StopGrace` | 25s | how long running jobs may finish after the context ends |
 | `MaxAttempts` | 5 | tries before the dead letters |
 | `Backoff` | 5s, 30s, 2m, 10m, 30m | wait before the next attempt |
@@ -288,14 +387,23 @@ behind PgBouncer in transaction mode, RDS Proxy and Cloud SQL managed pooling.
 `jobqueue.Scheduler`: `Store`, `Lease` (required), `Holder` (required, unique per process), `Name`
 (`jobqueue-scheduler`), `TTL` (30s), `Poll` (1s).
 
-`natsq.Config`: `Prefix` (`jobs`), `Stream` (the prefix in upper case), `Poll` (2s), `AckWait` (60s), `Replicas` (1),
+`natsq.Config`: `KeyShards` (4 ordered lanes per kind), `Prefix` (`jobs`), `Stream` (the prefix in upper case), `Poll` (2s), `AckWait` (60s), `Replicas` (1),
 `MaxAge` (7 days), `DeadMaxAge` (30 days), `Duplicates` (10 min: a second publish of the same kind and id is dropped),
 `Storage` (file).
 
 `sqsq.Config`: `Prefix` (`jobs`), `Wait` (5s long poll, at most 20s), `Visibility` (60s), `CreateQueues` (false),
-`MaxReceives` (50).
+`FIFO` (false), `MaxReceives` (50).
 
-`pubsubq.Config`: `Project` (required), `Prefix` (`jobs`), `Poll` (5s), `AckDeadline` (60s), `CreateResources` (false).
+`kafkaq.Config`: `Brokers` (required), `Options` (extra `kgo.Opt`), `Prefix` (`jobs`), `CreateTopics` (false),
+`Partitions` (6), `ReplicationFactor` (broker default), `Poll` (2s).
+
+`rabbitq.Config`: `Prefix` (`jobs`), `Prefetch` (20), `KeyShards` (4), `Poll` (2s).
+
+`redisq.Config`: `Prefix` (`jobs`), `Group` (`workers`), `Consumer` (host, pid, random), `Poll` (2s), `Visibility`
+(60s: a job idle this long is taken over by another worker), `DeadMaxLen` (10000).
+
+`pubsubq.Config`: `Project` (required), `Prefix` (`jobs`), `Poll` (5s), `AckDeadline` (60s), `CreateResources` (false),
+`Ordering` (false).
 
 ## Adapters at a glance
 
@@ -304,11 +412,50 @@ behind PgBouncer in transaction mode, RDS Proxy and Cloud SQL managed pooling.
 | `natsq` | any (server schedules, to the second) | native | yes, within `Duplicates` | nats-server 2.15 |
 | `sqsq` | up to 15 min | scheduler | no | ElasticMQ |
 | `pubsubq` | scheduler | scheduler | no | the gcloud Pub/Sub emulator |
+| `kafkaq` | scheduler | scheduler | no | Redpanda 25.2 |
+| `rabbitq` | any (wait queues, to the second) | scheduler | no | RabbitMQ 4.1 |
+| `redisq` | any (a sorted set) | scheduler | no | Valkey 8.1 |
+| `sqsq` FIFO | scheduler | scheduler | yes, 5 minutes | ElasticMQ |
 | `memq` | any | native | no | itself |
 | `pgq`, `natsq.Lease`, `dynamolease`, `firestorelease` | | | | PostgreSQL 16, nats-server, DynamoDB Local, the Firestore emulator |
 
 `sqsq`, `pubsubq`, `dynamolease` and `firestorelease` pass the suite on the emulators; they have not yet run against
-the real services. Treat them as **experimental** until they have.
+the real services. Treat them as **experimental** until they have. `kafkaq`, `rabbitq` and `redisq` ran against
+the real servers (Redpanda, RabbitMQ, Valkey), not yet against MSK, Confluent, Amazon MQ, ElastiCache or
+Memorystore.
+
+## Kafka: what is emulated
+
+Kafka keeps an offset per partition, not an acknowledgement per message, and holds nothing for later. `kafkaq`:
+
+- **Acknowledgement**: tracks the offsets it handed out per partition and commits a partition only up to the first
+  job not yet done. A crash redelivers every unfinished job (and some finished ones after it): at least once. One
+  slow job holds back its partition's commit, not the work after it.
+- **Retries** go through `<prefix>.<kind>.retry` with the attempt and a not-before time; the driver reads it in order,
+  waits until each is due and puts it back on the kind's topic. Head-of-line: a 30-minute back-off delays the
+  5-second ones behind it. Keyed jobs never use it: they are retried in place, so order holds.
+- **Dead letters** go to `<prefix>.dead` with the attempts and the error in headers.
+- **Delays and repeats** go through the Scheduler (`MaxDelay` is 0).
+- **Order**: a key maps to one partition, a partition to one group member, and the driver holds a key's next record
+  until the previous one is done. A rebalance hands unfinished records to the new owner in order.
+
+## Throughput
+
+Empty jobs, one worker process, measured with `go run ./examples/throughput -driver <d> -n 20000` on one development
+machine (8 cores) with the servers from `scripts/test-env.sh` in local containers, `BatchSize` 100,
+`Concurrency` 32. Publish is `PublishBatch` in batches of 100; run is fetch, handle and acknowledge each job.
+
+| Driver | Publish (jobs/s) | Run (jobs/s) |
+|---|---|---|
+| `memq` | 612,000 | 809,000 |
+| `kafkaq` (Redpanda, 6 partitions) | 56,900 | 252,000 |
+| `rabbitq` (quorum queues, confirms) | 14,800 | 35,100 |
+| `redisq` (Valkey) | 158,900 | 24,900 |
+| `natsq` (file storage, double acks) | 85,700 | 15,800 |
+| `sqsq` (ElasticMQ, batches of 10, 2,000 jobs) | 5,400 | 2,900 |
+
+These are local numbers to compare adapters and settings, not a promise for a cloud service: there the network round
+trip dominates, and larger batches and more concurrency pay off more.
 
 ## Run the demo
 
@@ -323,7 +470,7 @@ go run ./examples/demo -nats nats://127.0.0.1:4222
 ## Development
 
 ```sh
-eval "$(scripts/test-env.sh up)"   # nats-server, ElasticMQ, DynamoDB Local, the Pub/Sub and Firestore emulators, PostgreSQL
+eval "$(scripts/test-env.sh up)"   # nats-server, Redpanda, RabbitMQ, Valkey, ElasticMQ, DynamoDB Local, the Pub/Sub and Firestore emulators, PostgreSQL
 gofmt -l . && go vet ./... && go test -race ./...
 scripts/test-env.sh down
 ```

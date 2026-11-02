@@ -39,6 +39,9 @@ type Config struct {
 	// CreateResources makes missing topics and subscriptions (needs pubsub.topics.create and
 	// pubsub.subscriptions.create). When false they must exist.
 	CreateResources bool
+	// Ordering creates the subscriptions with message ordering and publishes a job's Key as its ordering key, so
+	// Pub/Sub delivers a key's jobs in order. (Ordering needs the publisher and the subscription in one region.)
+	Ordering bool
 }
 
 // Driver is the Pub/Sub driver.
@@ -52,7 +55,11 @@ type Driver struct {
 	seen  map[string]int
 }
 
-var _ jobqueue.Driver = (*Driver)(nil)
+var (
+	_ jobqueue.Driver        = (*Driver)(nil)
+	_ jobqueue.BatchSender   = (*Driver)(nil)
+	_ jobqueue.BatchReceiver = (*Driver)(nil)
+)
 
 // New connects with the default credentials (or the emulator named by PUBSUB_EMULATOR_HOST) plus opts.
 func New(ctx context.Context, cfg Config, opts ...option.ClientOption) (*Driver, error) {
@@ -110,7 +117,7 @@ func (d *Driver) prepare(ctx context.Context, kind string) error {
 		return fmt.Errorf("pubsubq: topic: %w", err)
 	}
 	_, err := d.sub.CreateSubscription(ctx, &pubsubpb.Subscription{Name: d.subscription(kind), Topic: d.topic(kind),
-		AckDeadlineSeconds: int32(d.cfg.AckDeadline / time.Second)})
+		AckDeadlineSeconds: int32(d.cfg.AckDeadline / time.Second), EnableMessageOrdering: d.cfg.Ordering})
 	if err != nil && !exists(err) {
 		return fmt.Errorf("pubsubq: subscription: %w", err)
 	}
@@ -153,43 +160,88 @@ func (d *Driver) Send(ctx context.Context, m jobqueue.Message, delay time.Durati
 	if err := d.prepare(ctx, m.Kind); err != nil {
 		return err
 	}
+	return d.SendBatch(ctx, []jobqueue.Message{m})
+}
+
+func (d *Driver) message(m jobqueue.Message) (*pubsubpb.PubsubMessage, error) {
 	data, err := json.Marshal(m)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	_, err = d.pub.Publish(ctx, &pubsubpb.PublishRequest{Topic: d.topic(m.Kind),
-		Messages: []*pubsubpb.PubsubMessage{{Data: data, Attributes: map[string]string{"job_id": m.ID}}}})
-	return err
+	pm := &pubsubpb.PubsubMessage{Data: data, Attributes: map[string]string{"job_id": m.ID}}
+	if d.cfg.Ordering {
+		pm.OrderingKey = m.Key
+	}
+	return pm, nil
+}
+
+// SendBatch publishes messages with one request per kind (up to 1000 each).
+func (d *Driver) SendBatch(ctx context.Context, ms []jobqueue.Message) error {
+	byKind := map[string][]*pubsubpb.PubsubMessage{}
+	var order []string
+	for _, m := range ms {
+		pm, err := d.message(m)
+		if err != nil {
+			return err
+		}
+		if _, ok := byKind[m.Kind]; !ok {
+			order = append(order, m.Kind)
+		}
+		byKind[m.Kind] = append(byKind[m.Kind], pm)
+	}
+	for _, kind := range order {
+		if err := d.prepare(ctx, kind); err != nil {
+			return err
+		}
+		list := byKind[kind]
+		for len(list) > 0 {
+			n := min(1000, len(list))
+			if _, err := d.pub.Publish(ctx, &pubsubpb.PublishRequest{Topic: d.topic(kind), Messages: list[:n]}); err != nil {
+				return err
+			}
+			list = list[n:]
+		}
+	}
+	return nil
 }
 
 // Receive pulls one message of kind, waiting up to Poll.
 func (d *Driver) Receive(ctx context.Context, kind string) (jobqueue.Delivery, error) {
+	ds, err := d.ReceiveBatch(ctx, kind, 1)
+	if len(ds) == 0 {
+		return nil, err
+	}
+	return ds[0], err
+}
+
+// ReceiveBatch pulls up to max messages of kind, waiting up to Poll.
+func (d *Driver) ReceiveBatch(ctx context.Context, kind string, max int) ([]jobqueue.Delivery, error) {
 	if err := d.prepare(ctx, kind); err != nil {
 		return nil, err
 	}
 	pctx, cancel := context.WithTimeout(ctx, d.cfg.Poll)
 	defer cancel()
-	out, err := d.sub.Pull(pctx, &pubsubpb.PullRequest{Subscription: d.subscription(kind), MaxMessages: 1})
+	out, err := d.sub.Pull(pctx, &pubsubpb.PullRequest{Subscription: d.subscription(kind), MaxMessages: int32(max)})
 	if err != nil {
 		if pctx.Err() != nil || status.Code(err) == codes.DeadlineExceeded || status.Code(err) == codes.Canceled {
 			return nil, nil
 		}
 		return nil, err
 	}
-	if len(out.ReceivedMessages) == 0 {
-		return nil, nil
+	var ds []jobqueue.Delivery
+	for _, rm := range out.ReceivedMessages {
+		var m jobqueue.Message
+		if err := json.Unmarshal(rm.Message.GetData(), &m); err != nil || m.Kind == "" {
+			_ = d.sub.Acknowledge(ctx, &pubsubpb.AcknowledgeRequest{Subscription: d.subscription(kind), AckIds: []string{rm.AckId}})
+			continue // not ours: dropped
+		}
+		attempt := int(rm.GetDeliveryAttempt()) // set when the subscription has a dead-letter policy
+		if attempt == 0 {
+			attempt = d.countAttempt(m.ID)
+		}
+		ds = append(ds, &delivery{d: d, sub: d.subscription(kind), ackID: rm.AckId, m: m, attempt: attempt})
 	}
-	rm := out.ReceivedMessages[0]
-	var m jobqueue.Message
-	if err := json.Unmarshal(rm.Message.GetData(), &m); err != nil || m.Kind == "" {
-		_ = d.sub.Acknowledge(ctx, &pubsubpb.AcknowledgeRequest{Subscription: d.subscription(kind), AckIds: []string{rm.AckId}})
-		return nil, errors.New("pubsubq: dropped a message that is not a jobqueue message")
-	}
-	attempt := int(rm.GetDeliveryAttempt()) // set when the subscription has a dead-letter policy
-	if attempt == 0 {
-		attempt = d.countAttempt(m.ID)
-	}
-	return &delivery{d: d, sub: d.subscription(kind), ackID: rm.AckId, m: m, attempt: attempt}, nil
+	return ds, nil
 }
 
 // countAttempt counts deliveries in this process when Pub/Sub does not (no dead-letter policy on the subscription).

@@ -31,6 +31,7 @@ type Driver struct {
 	timers  map[*time.Timer]struct{}
 	repeats map[string]*time.Ticker
 	dead    []Dead
+	busy    map[string]bool // kind+key of keyed messages being handled
 	closed  bool
 	poll    time.Duration
 }
@@ -38,7 +39,7 @@ type Driver struct {
 // New returns an empty driver. Receive waits up to poll (default 100 ms) for a message.
 func New(poll ...time.Duration) *Driver {
 	d := &Driver{ready: map[string][]item{}, wake: make(chan struct{}), timers: map[*time.Timer]struct{}{},
-		repeats: map[string]*time.Ticker{}, poll: 100 * time.Millisecond}
+		repeats: map[string]*time.Ticker{}, busy: map[string]bool{}, poll: 100 * time.Millisecond}
 	if len(poll) > 0 && poll[0] > 0 {
 		d.poll = poll[0]
 	}
@@ -46,7 +47,75 @@ func New(poll ...time.Duration) *Driver {
 }
 
 var _ jobqueue.Driver = (*Driver)(nil)
-var _ jobqueue.Repeater = (*Driver)(nil)
+var (
+	_ jobqueue.Repeater      = (*Driver)(nil)
+	_ jobqueue.BatchSender   = (*Driver)(nil)
+	_ jobqueue.BatchReceiver = (*Driver)(nil)
+	_ jobqueue.Orderer       = (*Driver)(nil)
+)
+
+// OrdersByKey is true: a keyed message is not handed out while an earlier one with its key is being handled.
+func (d *Driver) OrdersByKey() bool { return true }
+
+func busyKey(m jobqueue.Message) string { return m.Kind + "\x00" + m.Key }
+
+// SendBatch queues messages at once.
+func (d *Driver) SendBatch(ctx context.Context, ms []jobqueue.Message) error {
+	for _, m := range ms {
+		d.push(item{m: m, attempt: 1})
+	}
+	return nil
+}
+
+// ReceiveBatch takes up to max messages of kind, waiting up to the poll time for the first.
+func (d *Driver) ReceiveBatch(ctx context.Context, kind string, max int) ([]jobqueue.Delivery, error) {
+	first, err := d.Receive(ctx, kind)
+	if first == nil || err != nil {
+		return nil, err
+	}
+	out := []jobqueue.Delivery{first}
+	for len(out) < max {
+		x, ok := d.take(kind)
+		if !ok {
+			break
+		}
+		out = append(out, x)
+	}
+	return out, nil
+}
+
+// take hands out the first message of kind whose key is not busy.
+func (d *Driver) take(kind string) (jobqueue.Delivery, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	q := d.ready[kind]
+	for i, it := range q {
+		if it.m.Key != "" {
+			if d.busy[busyKey(it.m)] {
+				continue
+			}
+			d.busy[busyKey(it.m)] = true
+		}
+		if i == 0 {
+			d.ready[kind] = q[1:]
+		} else {
+			d.ready[kind] = append(q[:i:i], q[i+1:]...)
+		}
+		return &delivery{d: d, it: it}, true
+	}
+	return nil, false
+}
+
+func (d *Driver) done(m jobqueue.Message) {
+	if m.Key == "" {
+		return
+	}
+	d.mu.Lock()
+	delete(d.busy, busyKey(m))
+	close(d.wake)
+	d.wake = make(chan struct{})
+	d.mu.Unlock()
+}
 
 // MaxDelay is Unlimited.
 func (d *Driver) MaxDelay() time.Duration { return jobqueue.Unlimited }
@@ -115,13 +184,10 @@ func (d *Driver) Receive(ctx context.Context, kind string) (jobqueue.Delivery, e
 	deadline := time.NewTimer(d.poll)
 	defer deadline.Stop()
 	for {
-		d.mu.Lock()
-		if q := d.ready[kind]; len(q) > 0 {
-			it := q[0]
-			d.ready[kind] = q[1:]
-			d.mu.Unlock()
-			return &delivery{d: d, it: it}, nil
+		if x, ok := d.take(kind); ok {
+			return x, nil
 		}
+		d.mu.Lock()
 		wake := d.wake
 		d.mu.Unlock()
 		select {
@@ -181,10 +247,20 @@ type delivery struct {
 
 func (x *delivery) Message() jobqueue.Message    { return x.it.m }
 func (x *delivery) Attempt() int                 { return x.it.attempt }
-func (x *delivery) Ack(context.Context) error    { return nil }
+func (x *delivery) Ack(context.Context) error    { x.d.done(x.it.m); return nil }
 func (x *delivery) Extend(context.Context) error { return nil }
 func (x *delivery) Retry(_ context.Context, delay time.Duration) error {
-	x.d.later(delay, item{m: x.it.m, attempt: x.it.attempt + 1})
+	next := item{m: x.it.m, attempt: x.it.attempt + 1}
+	if x.it.m.Key != "" && delay <= 0 {
+		// A keyed message goes back to the front, ahead of the ones that follow it.
+		x.d.mu.Lock()
+		x.d.ready[next.m.Kind] = append([]item{next}, x.d.ready[next.m.Kind]...)
+		x.d.mu.Unlock()
+		x.d.done(x.it.m)
+		return nil
+	}
+	x.d.done(x.it.m)
+	x.d.later(delay, next)
 	return nil
 }
 

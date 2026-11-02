@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"regexp"
 	"strings"
 	"sync"
@@ -40,6 +41,9 @@ type Config struct {
 	Duplicates time.Duration
 	// Storage is file (default) or memory.
 	Storage jetstream.StorageType
+	// KeyShards is how many ordered lanes each kind has for keyed jobs (default 4). A key always goes to the same
+	// lane, and a lane hands out one job at a time across all workers (a consumer with MaxAckPending 1).
+	KeyShards int
 }
 
 // Driver is the JetStream driver.
@@ -52,9 +56,55 @@ type Driver struct {
 }
 
 var (
-	_ jobqueue.Driver   = (*Driver)(nil)
-	_ jobqueue.Repeater = (*Driver)(nil)
+	_ jobqueue.Driver        = (*Driver)(nil)
+	_ jobqueue.Repeater      = (*Driver)(nil)
+	_ jobqueue.BatchSender   = (*Driver)(nil)
+	_ jobqueue.BatchReceiver = (*Driver)(nil)
+	_ jobqueue.Orderer       = (*Driver)(nil)
 )
+
+// OrdersByKey is true: keyed jobs go through ordered lanes (see Config.KeyShards).
+func (d *Driver) OrdersByKey() bool { return true }
+
+func (d *Driver) shard(key string) int {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(key))
+	return int(h.Sum32() % uint32(d.cfg.KeyShards))
+}
+
+// target is the subject a message goes to: its kind's, or its key's lane.
+func (d *Driver) target(m jobqueue.Message) string {
+	if m.Key != "" {
+		return fmt.Sprintf("%s.key.%d.%s", d.cfg.Prefix, d.shard(m.Key), m.Kind)
+	}
+	return d.run(m.Kind)
+}
+
+// SendBatch publishes undelayed messages asynchronously and waits for all acknowledgements.
+func (d *Driver) SendBatch(ctx context.Context, ms []jobqueue.Message) error {
+	futures := make([]jetstream.PubAckFuture, 0, len(ms))
+	for _, m := range ms {
+		data, err := encode(m)
+		if err != nil {
+			return err
+		}
+		f, err := d.js.PublishAsync(d.target(m), data, jetstream.WithMsgID(m.Kind+":"+m.ID))
+		if err != nil {
+			return err
+		}
+		futures = append(futures, f)
+	}
+	for _, f := range futures {
+		select {
+		case <-f.Ok():
+		case err := <-f.Err():
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
 
 // New makes (or updates) the streams and returns the driver.
 func New(ctx context.Context, js jetstream.JetStream, cfg Config) (*Driver, error) {
@@ -82,9 +132,12 @@ func New(ctx context.Context, js jetstream.JetStream, cfg Config) (*Driver, erro
 	if cfg.Duplicates <= 0 {
 		cfg.Duplicates = 10 * time.Minute
 	}
+	if cfg.KeyShards <= 0 {
+		cfg.KeyShards = 4
+	}
 	_, err := js.CreateOrUpdateStream(ctx, jetstream.StreamConfig{
 		Name:              cfg.Stream,
-		Subjects:          []string{cfg.Prefix + ".run.>", cfg.Prefix + ".sched.>"},
+		Subjects:          []string{cfg.Prefix + ".run.>", cfg.Prefix + ".key.>", cfg.Prefix + ".sched.>"},
 		Retention:         jetstream.WorkQueuePolicy,
 		Storage:           cfg.Storage,
 		Replicas:          cfg.Replicas,
@@ -128,7 +181,7 @@ func (d *Driver) Send(ctx context.Context, m jobqueue.Message, delay time.Durati
 		return err
 	}
 	if delay <= 0 {
-		_, err = d.js.Publish(ctx, d.run(m.Kind), data, jetstream.WithMsgID(m.Kind+":"+m.ID))
+		_, err = d.js.Publish(ctx, d.target(m), data, jetstream.WithMsgID(m.Kind+":"+m.ID))
 		return err
 	}
 	// Schedules are to the second: round up, so it is never early.
@@ -136,7 +189,7 @@ func (d *Driver) Send(ctx context.Context, m jobqueue.Message, delay time.Durati
 	msg := nats.NewMsg(d.cfg.Prefix + ".sched." + token(m.Kind+"."+m.ID))
 	msg.Data = data
 	msg.Header.Set("Nats-Rollup", "sub")
-	_, err = d.js.PublishMsg(ctx, msg, jetstream.WithScheduleAt(at), jetstream.WithScheduleTarget(d.run(m.Kind)))
+	_, err = d.js.PublishMsg(ctx, msg, jetstream.WithScheduleAt(at), jetstream.WithScheduleTarget(d.target(m)))
 	return err
 }
 
@@ -149,47 +202,96 @@ func (d *Driver) SendEvery(ctx context.Context, m jobqueue.Message, every time.D
 	msg := nats.NewMsg(d.cfg.Prefix + ".sched." + token(m.Kind+"."+m.ID))
 	msg.Data = data
 	msg.Header.Set("Nats-Rollup", "sub")
-	_, err = d.js.PublishMsg(ctx, msg, jetstream.WithScheduleEvery(every), jetstream.WithScheduleTarget(d.run(m.Kind)))
+	_, err = d.js.PublishMsg(ctx, msg, jetstream.WithScheduleEvery(every), jetstream.WithScheduleTarget(d.target(m)))
 	return err
 }
 
-func (d *Driver) consumer(ctx context.Context, kind string) (jetstream.Consumer, error) {
+// consumer is the durable consumer of a subject (lane -1: the kind's unkeyed jobs; else a key lane, one job at a time).
+func (d *Driver) consumer(ctx context.Context, kind string, lane int) (jetstream.Consumer, error) {
+	name := token(d.cfg.Stream + "_" + kind)
+	filter := d.run(kind)
+	maxAck := 1000
+	if lane >= 0 {
+		name = fmt.Sprintf("%s_k%d", name, lane)
+		filter = fmt.Sprintf("%s.key.%d.%s", d.cfg.Prefix, lane, kind)
+		maxAck = 1
+	}
 	d.mu.Lock()
-	c, ok := d.consumers[kind]
+	c, ok := d.consumers[name]
 	d.mu.Unlock()
 	if ok {
 		return c, nil
 	}
 	c, err := d.js.CreateOrUpdateConsumer(ctx, d.cfg.Stream, jetstream.ConsumerConfig{
-		Durable:       token(d.cfg.Stream + "_" + kind),
-		FilterSubject: d.run(kind),
+		Durable:       name,
+		FilterSubject: filter,
 		AckPolicy:     jetstream.AckExplicitPolicy,
 		AckWait:       d.cfg.AckWait,
 		MaxDeliver:    -1, // the Queue counts attempts and dead-letters
-		MaxAckPending: 1000,
+		MaxAckPending: maxAck,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("natsq: consumer for %s: %w", kind, err)
 	}
 	d.mu.Lock()
-	d.consumers[kind] = c
+	d.consumers[name] = c
 	d.mu.Unlock()
 	return c, nil
 }
 
-// Receive fetches the next job of kind, waiting up to Poll.
+// Receive fetches the next job of kind: from a key lane if one has a job ready, else from the kind's unkeyed jobs,
+// waiting up to Poll.
 func (d *Driver) Receive(ctx context.Context, kind string) (jobqueue.Delivery, error) {
-	c, err := d.consumer(ctx, kind)
-	if err != nil {
+	ds, err := d.ReceiveBatch(ctx, kind, 1)
+	if len(ds) == 0 {
 		return nil, err
 	}
-	batch, err := c.Fetch(1, jetstream.FetchMaxWait(d.cfg.Poll))
+	return ds[0], err
+}
+
+// ReceiveBatch fetches up to max jobs of kind: at most one per key lane (without waiting), the rest unkeyed.
+func (d *Driver) ReceiveBatch(ctx context.Context, kind string, max int) ([]jobqueue.Delivery, error) {
+	var out []jobqueue.Delivery
+	start := int(time.Now().UnixNano() % int64(d.cfg.KeyShards))
+	for i := 0; i < d.cfg.KeyShards && len(out) < max; i++ {
+		c, err := d.consumer(ctx, kind, (start+i)%d.cfg.KeyShards)
+		if err != nil {
+			return out, err
+		}
+		batch, err := c.FetchNoWait(1)
+		if err != nil {
+			continue
+		}
+		out = append(out, d.decode(ctx, kind, batch)...)
+	}
+	if len(out) >= max {
+		return out, nil
+	}
+	c, err := d.consumer(ctx, kind, -1)
+	if err != nil {
+		return out, err
+	}
+	var batch jetstream.MessageBatch
+	if len(out) > 0 {
+		batch, err = c.FetchNoWait(max - len(out))
+	} else {
+		batch, err = c.Fetch(max, jetstream.FetchMaxWait(d.cfg.Poll))
+	}
 	if err != nil {
 		if errors.Is(err, nats.ErrTimeout) || errors.Is(err, context.Canceled) {
-			return nil, nil
+			return out, nil
 		}
-		return nil, err
+		return out, err
 	}
+	out = append(out, d.decode(ctx, kind, batch)...)
+	if err := batch.Error(); err != nil && !errors.Is(err, nats.ErrTimeout) && !errors.Is(err, context.Canceled) {
+		return out, err
+	}
+	return out, nil
+}
+
+func (d *Driver) decode(ctx context.Context, kind string, batch jetstream.MessageBatch) []jobqueue.Delivery {
+	var out []jobqueue.Delivery
 	for msg := range batch.Messages() {
 		var m jobqueue.Message
 		if err := json.Unmarshal(msg.Data(), &m); err != nil || m.Kind == "" {
@@ -206,12 +308,9 @@ func (d *Driver) Receive(ctx context.Context, kind string) (jobqueue.Delivery, e
 				m.ID = jobqueue.Occurrence(m.ID, meta.Timestamp) // one run of a repeat
 			}
 		}
-		return &delivery{msg: msg, m: m, attempt: attempt}, nil
+		out = append(out, &delivery{msg: msg, m: m, attempt: attempt})
 	}
-	if err := batch.Error(); err != nil && !errors.Is(err, nats.ErrTimeout) && !errors.Is(err, context.Canceled) {
-		return nil, err
-	}
-	return nil, nil
+	return out
 }
 
 func quote(b []byte) []byte {

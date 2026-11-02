@@ -37,3 +37,9 @@ func TestDriver(t *testing.T) {
 func TestSchedulerOver(t *testing.T) {
 	jobqueuetest.SchedulerOver(t, newDriver(t), memq.NewStore(), memq.NewLease())
 }
+
+func TestDriverFIFO(t *testing.T) {
+	jobqueuetest.Driver(t, func(t *testing.T) jobqueue.Driver {
+		return sqsq.New(client(t), sqsq.Config{Prefix: "jqfifo", Wait: time.Second, CreateQueues: true, FIFO: true})
+	})
+}

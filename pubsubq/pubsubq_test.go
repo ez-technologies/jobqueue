@@ -20,7 +20,7 @@ func newDriver(t *testing.T) *pubsubq.Driver {
 		t.Skip("JOBQUEUE_TEST_PUBSUB_EMULATOR is not set (eval \"$(scripts/test-env.sh up)\")")
 	}
 	t.Setenv("PUBSUB_EMULATOR_HOST", host)
-	d, err := pubsubq.New(context.Background(), pubsubq.Config{Project: "jobqueue-test", Prefix: "jqtest",
+	d, err := pubsubq.New(context.Background(), pubsubq.Config{Project: "jobqueue-test", Prefix: "jqtest", Ordering: true,
 		Poll: time.Second, CreateResources: true})
 	if err != nil {
 		t.Fatal(err)
