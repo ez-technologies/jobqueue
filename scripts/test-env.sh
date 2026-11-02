@@ -7,7 +7,7 @@ set -euo pipefail
 P=jobqueue-test
 case "${1:-up}" in
 up)
-  run() { docker inspect "$P-$1" >/dev/null 2>&1 || docker run -d --name "$P-$1" "${@:2}" >/dev/null; }
+  run() { docker start "$P-$1" >/dev/null 2>&1 || docker run -d --name "$P-$1" "${@:2}" >/dev/null; }
   run nats -p 127.0.0.1:4231:4222 nats:2.15.2-alpine -js
   run sqs -p 127.0.0.1:9331:9324 softwaremill/elasticmq-native:1.6.14
   run dynamodb -p 127.0.0.1:8001:8000 amazon/dynamodb-local:2.6.1 -jar DynamoDBLocal.jar -inMemory

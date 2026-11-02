@@ -584,7 +584,7 @@ Kafka keeps an offset per partition, not an acknowledgement per message, and hol
 ## Throughput
 
 Empty jobs, one worker process, measured with `go run ./examples/throughput -driver <d> -n 20000` on one development
-machine (8 cores) with the servers from `scripts/test-env.sh` in local containers, `BatchSize` 100,
+machine (4 cores, `jobqueue` v0.2.0: not measured again since the v0.3.0 runtime) with the servers from `scripts/test-env.sh` in local containers, `BatchSize` 100,
 `Concurrency` 32. Publish is `PublishBatch` in batches of 100; run is fetch, handle and acknowledge each job.
 
 | Driver | Publish (jobs/s) | Run (jobs/s) |
